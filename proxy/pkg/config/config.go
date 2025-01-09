@@ -20,12 +20,13 @@ type Config struct {
 
 	// Global bucket
 
-	PrimaryCluster                string `default:"ORIGIN" split_words:"true" yaml:"primary_cluster"`
-	ReadMode                      string `default:"PRIMARY_ONLY" split_words:"true" yaml:"read_mode"`
-	ReplaceCqlFunctions           bool   `default:"false" split_words:"true" yaml:"replace_cql_functions"`
-	AsyncHandshakeTimeoutMs       int    `default:"4000" split_words:"true" yaml:"async_handshake_timeout_ms"`
-	LogLevel                      string `default:"INFO" split_words:"true" yaml:"log_level"`
-	ControlConnMaxProtocolVersion string `default:"DseV2" split_words:"true" yaml:"control_conn_max_protocol_version"` // Numeric Cassandra OSS protocol version or DseV1 / DseV2
+	PrimaryCluster                string            `default:"ORIGIN" split_words:"true" yaml:"primary_cluster"`
+	ReadMode                      string            `default:"PRIMARY_ONLY" split_words:"true" yaml:"read_mode"`
+	ReplaceCqlFunctions           bool              `default:"false" split_words:"true" yaml:"replace_cql_functions"`
+	AsyncHandshakeTimeoutMs       int               `default:"4000" split_words:"true" yaml:"async_handshake_timeout_ms"`
+	LogLevel                      string            `default:"INFO" split_words:"true" yaml:"log_level"`
+	ControlConnMaxProtocolVersion string            `default:"DseV2" split_words:"true" yaml:"control_conn_max_protocol_version"` // Numeric Cassandra OSS protocol version or DseV1 / DseV2
+	KeyspaceMappings              map[string]string `default:"" split_words:"true" yaml:"keyspace_mappings"`
 
 	// Proxy Topology (also known as system.peers "virtualization") bucket
 

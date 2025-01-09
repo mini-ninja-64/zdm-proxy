@@ -89,6 +89,7 @@ type QueryInfo interface {
 	replaceNowFunctionCallsWithLiteral() (QueryInfo, []*term)
 	replaceNowFunctionCallsWithPositionalBindMarkers() (QueryInfo, []*term)
 	replaceNowFunctionCallsWithNamedBindMarkers() (QueryInfo, []*term)
+	replaceKeyspaceName(keyspace string) QueryInfo
 }
 
 func inspectCqlQuery(query string, currentKeyspace string, timeUuidGenerator TimeUuidGenerator) QueryInfo {
@@ -887,6 +888,27 @@ func (l *cqlListener) replaceNowFunctionCallsWithNamedBindMarkers() (QueryInfo, 
 			return "", noReplacement
 		}
 	})
+}
+
+func (l *cqlListener) replaceKeyspaceName(keyspaceName string) QueryInfo {
+
+	//newQueryInfo := l.shallowClone()
+	//newQueryInfo.keyspaceName = keyspaceName
+	//newQueryInfo.getApplicableKeyspace()
+	//newQueryInfo.query
+
+	//return newQueryInfo
+	for _, parsedStmt := range l.parsedStatements {
+		newParsedStmt := parsedStmt.ShallowClone()
+		switch newParsedStmt.statementType {
+		}
+		//newTerms := make([]*term, 0)
+		for _, t := range parsedStmt.terms {
+			fmt.Printf("%s\n", t.literal)
+		}
+
+	}
+	return nil
 }
 
 func (l *cqlListener) shallowClone() *cqlListener {

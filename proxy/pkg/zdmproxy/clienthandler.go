@@ -6,6 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
@@ -14,12 +21,6 @@ import (
 	"github.com/datastax/zdm-proxy/proxy/pkg/metrics"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
-	"net"
-	"sort"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 /*
@@ -1367,6 +1368,32 @@ func (ch *ClientHandler) forwardRequest(request *frame.RawFrame, customResponseC
 	if err != nil {
 		return err
 	}
+
+	//originContext := context
+	//targetContext := context
+
+	fmt.Printf("%s\n", ch.conf.KeyspaceMappings)
+	if len(ch.conf.KeyspaceMappings) != 0 {
+		_, statementsQueryData, err := context.GetOrDecodeAndInspect(currentKeyspace, ch.timeUuidGenerator)
+		if err != nil {
+			if errors.Is(err, NotInspectableErr) {
+				return nil
+			}
+			return fmt.Errorf("could not check whether query needs replacement for a '%v' request: %w",
+				context.GetRawFrame().Header.OpCode.String(), err)
+		}
+		// originFrame := frame.DeepCopy()
+		// targetFrame := frame.DeepCopy()
+		for _, stmtQueryData := range statementsQueryData {
+			targetKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
+			newKeyspace, keyspaceShouldBeReplaced := ch.conf.KeyspaceMappings[targetKeyspace]
+			if keyspaceShouldBeReplaced {
+				fmt.Printf("replacing keyspace %s with %s", targetKeyspace, newKeyspace)
+				stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
+			}
+		}
+	}
+
 	requestInfo, err := buildRequestInfo(
 		context, replacedTerms, ch.preparedStatementCache, ch.metricHandler, currentKeyspace, ch.primaryCluster,
 		ch.forwardSystemQueriesToTarget, ch.topologyConfig.VirtualizationEnabled, ch.forwardAuthToTarget, ch.timeUuidGenerator)
