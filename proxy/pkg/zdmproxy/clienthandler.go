@@ -1372,28 +1372,6 @@ func (ch *ClientHandler) forwardRequest(request *frame.RawFrame, customResponseC
 	//originContext := context
 	//targetContext := context
 
-	fmt.Printf("%s\n", ch.conf.KeyspaceMappings)
-	if len(ch.conf.KeyspaceMappings) != 0 {
-		_, statementsQueryData, err := context.GetOrDecodeAndInspect(currentKeyspace, ch.timeUuidGenerator)
-		if err != nil {
-			if errors.Is(err, NotInspectableErr) {
-				return nil
-			}
-			return fmt.Errorf("could not check whether query needs replacement for a '%v' request: %w",
-				context.GetRawFrame().Header.OpCode.String(), err)
-		}
-		// originFrame := frame.DeepCopy()
-		// targetFrame := frame.DeepCopy()
-		for _, stmtQueryData := range statementsQueryData {
-			targetKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
-			newKeyspace, keyspaceShouldBeReplaced := ch.conf.KeyspaceMappings[targetKeyspace]
-			if keyspaceShouldBeReplaced {
-				fmt.Printf("replacing keyspace %s with %s", targetKeyspace, newKeyspace)
-				stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
-			}
-		}
-	}
-
 	requestInfo, err := buildRequestInfo(
 		context, replacedTerms, ch.preparedStatementCache, ch.metricHandler, currentKeyspace, ch.primaryCluster,
 		ch.forwardSystemQueriesToTarget, ch.topologyConfig.VirtualizationEnabled, ch.forwardAuthToTarget, ch.timeUuidGenerator)
@@ -1431,9 +1409,54 @@ func (ch *ClientHandler) executeRequest(
 	fwdDecision := requestInfo.GetForwardDecision()
 	log.Tracef("Opcode: %v, Forward decision: %v", frameContext.GetRawFrame().Header.OpCode, fwdDecision)
 
+	originFrame := frameContext.GetRawFrame()
+	targetFrameContext := frameContext
+	fmt.Printf("%s\n", ch.conf.KeyspaceMappings)
+	if len(ch.conf.KeyspaceMappings) != 0 {
+		_, statementsQueryData, err := frameContext.GetOrDecodeAndInspect(currentKeyspace, ch.timeUuidGenerator)
+		if err == nil {
+			newFrame := frameContext.decodedFrame.DeepCopy()
+			newStatementsQueryData := make([]*statementQueryData, 0, len(statementsQueryData))
+			for _, stmtQueryData := range statementsQueryData {
+				targetKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
+				newKeyspace, keyspaceShouldBeReplaced := ch.conf.KeyspaceMappings[targetKeyspace]
+				if keyspaceShouldBeReplaced {
+					fmt.Printf("replacing keyspace %s with %s", targetKeyspace, newKeyspace)
+					newQueryData := stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
+					switch m := newFrame.Body.Message.(type) {
+					case *message.Query:
+						m.Query = strings.ReplaceAll(m.Query, targetKeyspace, newKeyspace)
+					case *message.Prepare:
+						m.Query = strings.ReplaceAll(m.Query, targetKeyspace, newKeyspace)
+						if m.Keyspace != "" {
+							m.Keyspace = newKeyspace
+						}
+					}
+
+					newStatementsQueryData = append(newStatementsQueryData,
+						&statementQueryData{statementIndex: stmtQueryData.statementIndex, queryData: newQueryData})
+				}
+			}
+			//executeMsg, ok := newFrame.Body.Message.(*message.Execute)
+			//newFrame.Body.Message
+			//newFrame.Header
+			//newFrame.Body.Message
+			newRawFrame, err := defaultCodec.ConvertToRawFrame(newFrame)
+			if err != nil {
+				return fmt.Errorf("could not convert modified frame to raw frame: %w", err)
+			}
+			targetFrameContext = NewInitializedFrameDecodeContext(newRawFrame, newFrame, newStatementsQueryData)
+		} else {
+			if !errors.Is(err, NotInspectableErr) {
+				return fmt.Errorf("could not check whether query needs replacement for a '%v' request: %w",
+					frameContext.GetRawFrame().Header.OpCode.String(), err)
+			}
+		}
+	}
+
 	f := frameContext.GetRawFrame()
-	originRequest := f
-	targetRequest := f
+	originRequest := originFrame
+	targetRequest := targetFrameContext.GetRawFrame()
 	var clientResponse *frame.RawFrame
 	var err error
 
@@ -1441,11 +1464,11 @@ func (ch *ClientHandler) executeRequest(
 	case *InterceptedRequestInfo:
 		clientResponse, err = ch.handleInterceptedRequest(castedRequestInfo, frameContext, currentKeyspace)
 	case *PrepareRequestInfo:
-		clientResponse, originRequest, targetRequest, err = ch.handlePrepareRequest(castedRequestInfo, frameContext, currentKeyspace)
+		clientResponse, originRequest, targetRequest, err = ch.handlePrepareRequest(castedRequestInfo, frameContext, targetFrameContext, currentKeyspace)
 	case *ExecuteRequestInfo:
-		clientResponse, originRequest, targetRequest, err = ch.handleExecuteRequest(castedRequestInfo, frameContext, currentKeyspace)
+		clientResponse, originRequest, targetRequest, err = ch.handleExecuteRequest(castedRequestInfo, frameContext, targetFrameContext, currentKeyspace)
 	case *BatchRequestInfo:
-		originRequest, targetRequest, err = ch.handleBatchRequest(castedRequestInfo, frameContext)
+		originRequest, targetRequest, err = ch.handleBatchRequest(castedRequestInfo, frameContext, targetFrameContext)
 	}
 
 	if err != nil {
@@ -1664,13 +1687,13 @@ func (ch *ClientHandler) handleInterceptedRequest(
 }
 
 func (ch *ClientHandler) handlePrepareRequest(
-	castedRequestInfo *PrepareRequestInfo, frameContext *frameDecodeContext, currentKeyspace string) (
+	castedRequestInfo *PrepareRequestInfo, originFrameContext *frameDecodeContext, targetFrameContext *frameDecodeContext, currentKeyspace string) (
 	clientResponse *frame.RawFrame, originRequest *frame.RawFrame, targetRequest *frame.RawFrame, err error) {
 
-	f := frameContext.GetRawFrame()
+	f := originFrameContext.GetRawFrame()
 	switch castedRequestInfo.GetBaseRequestInfo().(type) {
 	case *InterceptedRequestInfo:
-		clientResponse, err = ch.handleInterceptedRequest(castedRequestInfo, frameContext, currentKeyspace)
+		clientResponse, err = ch.handleInterceptedRequest(castedRequestInfo, originFrameContext, currentKeyspace)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -1678,18 +1701,17 @@ func (ch *ClientHandler) handlePrepareRequest(
 		targetRequest = nil
 	default:
 		originRequest = f
-		targetRequest = f
+		targetRequest = targetFrameContext.GetRawFrame()
 	}
 	return clientResponse, originRequest, targetRequest, nil
 }
 
 func (ch *ClientHandler) handleExecuteRequest(
-	castedRequestInfo *ExecuteRequestInfo, frameContext *frameDecodeContext, currentKeyspace string) (
+	castedRequestInfo *ExecuteRequestInfo, originFrameContext *frameDecodeContext, targetFrameContext *frameDecodeContext, currentKeyspace string) (
 	clientResponse *frame.RawFrame, originRequest *frame.RawFrame, targetRequest *frame.RawFrame, err error) {
 
-	f := frameContext.GetRawFrame()
-	originRequest = f
-	targetRequest = f
+	originRequest = originFrameContext.GetRawFrame()
+	targetRequest = targetFrameContext.GetRawFrame()
 
 	preparedData := castedRequestInfo.GetPreparedData()
 	prepareRequestInfo := preparedData.GetPrepareRequestInfo()
@@ -1701,7 +1723,7 @@ func (ch *ClientHandler) handleExecuteRequest(
 			return nil, nil, nil, fmt.Errorf(
 				"expected intercepted statement info while handling bound statement but got %v", prepareRequestInfo.GetBaseRequestInfo())
 		}
-		clientResponse, err = ch.handleInterceptedRequest(interceptedRequestInfo, frameContext, currentKeyspace)
+		clientResponse, err = ch.handleInterceptedRequest(interceptedRequestInfo, originFrameContext, currentKeyspace)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -1714,7 +1736,7 @@ func (ch *ClientHandler) handleExecuteRequest(
 	asyncConnectorIsOrigin := ch.asyncConnector != nil && ch.asyncConnector.clusterType == common.ClusterTypeOrigin
 	var replacementTimeUuids []*uuid.UUID
 	if len(replacedTerms) > 0 && (fwdDecision == forwardToBoth || fwdDecision == forwardToOrigin || (sendToAsyncConnector && asyncConnectorIsOrigin)) {
-		clientRequest, err := frameContext.GetOrDecodeFrame()
+		clientRequest, err := originFrameContext.GetOrDecodeFrame()
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("could not decode execute raw frame: %w", err)
 		}
@@ -1737,7 +1759,7 @@ func (ch *ClientHandler) handleExecuteRequest(
 
 	asyncConnectorIsTarget := ch.asyncConnector != nil && ch.asyncConnector.clusterType == common.ClusterTypeTarget
 	if fwdDecision == forwardToBoth || fwdDecision == forwardToTarget || (sendToAsyncConnector && asyncConnectorIsTarget) {
-		clientRequest, err := frameContext.GetOrDecodeFrame()
+		clientRequest, err := originFrameContext.GetOrDecodeFrame()
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("could not decode execute raw frame: %w", err)
 		}
@@ -1777,13 +1799,13 @@ func (ch *ClientHandler) handleExecuteRequest(
 	return nil, originRequest, targetRequest, nil
 }
 
+// TODO: Fix batching
 func (ch *ClientHandler) handleBatchRequest(
-	castedRequestInfo *BatchRequestInfo, frameContext *frameDecodeContext) (
+	castedRequestInfo *BatchRequestInfo, originFrameContext *frameDecodeContext, targetFrameContext *frameDecodeContext) (
 	originRequest *frame.RawFrame, targetRequest *frame.RawFrame, err error) {
-	f := frameContext.GetRawFrame()
-	originRequest = f
-	targetRequest = f
-	decodedFrame, err := frameContext.GetOrDecodeFrame()
+	originRequest = originFrameContext.GetRawFrame()
+	targetRequest = targetFrameContext.GetRawFrame()
+	decodedFrame, err := originFrameContext.GetOrDecodeFrame()
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not decode batch raw frame: %w", err)
 	}

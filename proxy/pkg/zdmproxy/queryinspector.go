@@ -890,25 +890,17 @@ func (l *cqlListener) replaceNowFunctionCallsWithNamedBindMarkers() (QueryInfo, 
 	})
 }
 
-func (l *cqlListener) replaceKeyspaceName(keyspaceName string) QueryInfo {
-
-	//newQueryInfo := l.shallowClone()
-	//newQueryInfo.keyspaceName = keyspaceName
-	//newQueryInfo.getApplicableKeyspace()
-	//newQueryInfo.query
-
-	//return newQueryInfo
-	for _, parsedStmt := range l.parsedStatements {
-		newParsedStmt := parsedStmt.ShallowClone()
-		switch newParsedStmt.statementType {
-		}
-		//newTerms := make([]*term, 0)
-		for _, t := range parsedStmt.terms {
-			fmt.Printf("%s\n", t.literal)
-		}
-
+func (l *cqlListener) replaceKeyspaceName(newKeyspaceName string) QueryInfo {
+	if l.keyspaceName == "" {
+		return l
 	}
-	return nil
+
+	newQueryInfo := l.shallowClone()
+	currentKeyspace := newQueryInfo.keyspaceName
+	newQueryInfo.keyspaceName = newKeyspaceName
+
+	newQueryInfo.query = strings.ReplaceAll(newQueryInfo.query, currentKeyspace, newKeyspaceName)
+	return newQueryInfo
 }
 
 func (l *cqlListener) shallowClone() *cqlListener {
