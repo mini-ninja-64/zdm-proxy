@@ -4,10 +4,12 @@ import (
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/datastax/zdm-proxy/proxy/pkg/config"
 	"github.com/stretchr/testify/require"
 	"testing"
 )
 
+// TODO: Should check target frame too, should check keyspace translations
 func TestReplaceQueryString(t *testing.T) {
 	tests := []struct {
 		name                 string
@@ -158,28 +160,28 @@ func TestReplaceQueryString(t *testing.T) {
 			require.Nil(t, err)
 			statementsQueryData, err := context.GetOrInspectAllStatements("", timeUuidGenerator)
 			require.Nil(t, err)
-			queryModifier := NewQueryModifier(timeUuidGenerator)
-			newContext, statementsReplacedTerms, err := queryModifier.replaceQueryString("", context)
+			queryModifier := NewQueryModifier(&config.Config{ReplaceCqlFunctions: true}, timeUuidGenerator)
+			originFrame, _, err := queryModifier.processAndBifurcate("", context)
 			require.Nil(t, err)
-			require.Equal(t, len(test.positionsReplaced), len(statementsReplacedTerms))
-			require.Equal(t, len(test.replacedTerms), len(statementsReplacedTerms))
+			require.Equal(t, len(test.positionsReplaced), len(originFrame.replacedTerms))
+			require.Equal(t, len(test.replacedTerms), len(originFrame.replacedTerms))
 			if len(test.positionsReplaced) != 0 {
-				require.NotEqual(t, context.frame, newContext.frame)
-				require.Equal(t, context.frame.Header.OpCode, newContext.frame.Header.OpCode)
-				require.Equal(t, context.frame.Header.StreamId, newContext.frame.Header.StreamId)
-				require.Equal(t, context.frame.Header.Flags, newContext.frame.Header.Flags)
-				require.Equal(t, context.frame.Header.Version, newContext.frame.Header.Version)
-				require.NotEqual(t, context.frame.Body, newContext.frame.Body)
+				require.NotEqual(t, context.frame, originFrame.decodeContext.frame)
+				require.Equal(t, context.frame.Header.OpCode, originFrame.decodeContext.frame.Header.OpCode)
+				require.Equal(t, context.frame.Header.StreamId, originFrame.decodeContext.frame.Header.StreamId)
+				require.Equal(t, context.frame.Header.Flags, originFrame.decodeContext.frame.Header.Flags)
+				require.Equal(t, context.frame.Header.Version, originFrame.decodeContext.frame.Header.Version)
+				require.NotEqual(t, context.frame.Body, originFrame.decodeContext.frame.Body)
 			} else {
-				require.Equal(t, context.frame, newContext.frame)
-				require.Equal(t, context.frame.Body, newContext.frame.Body)
-				require.Equal(t, context.frame.Header, newContext.frame.Header)
+				require.Equal(t, context.frame, originFrame.decodeContext.frame)
+				require.Equal(t, context.frame.Body, originFrame.decodeContext.frame.Body)
+				require.Equal(t, context.frame.Header, originFrame.decodeContext.frame.Header)
 			}
 
-			require.Equal(t, test.replacedTerms, statementsReplacedTerms)
+			require.Equal(t, test.replacedTerms, originFrame.replacedTerms)
 			require.Equal(t, len(test.statementTypes), len(statementsQueryData))
 			for idx, stmtQueryData := range statementsQueryData {
-				newStmtQueryData := newContext.statementsQueryData[idx]
+				newStmtQueryData := originFrame.decodeContext.statementsQueryData[idx]
 
 				require.Equal(t, test.statementTypes[stmtQueryData.statementIndex], stmtQueryData.queryData.getStatementType())
 				require.Equal(t, test.statementTypes[stmtQueryData.statementIndex], newStmtQueryData.queryData.getStatementType())

@@ -14,6 +14,7 @@ type statementType string
 type replacementType int
 
 const (
+	// TODO: Maybe should support create?
 	statementTypeInsert = statementType("insert")
 	statementTypeUpdate = statementType("update")
 	statementTypeDelete = statementType("delete")
@@ -64,7 +65,7 @@ type QueryInfo interface {
 	// or BATCH statements containing INSERT statements.
 
 	// Returns a slice of parsedStatement. There is one parsedStatement per statement in the query.
-	// For a single INSERT/UPDATE/DELETE, the slice contains only one element. For BATCH statements,
+	// For a single SELECT/INSERT/UPDATE/DELETE, the slice contains only one element. For BATCH statements,
 	// the slice will contain as many elements as there are child statements.
 	getParsedStatements() []*parsedStatement
 

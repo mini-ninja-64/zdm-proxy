@@ -317,7 +317,7 @@ func NewClientHandler(
 		forwardSystemQueriesToTarget:         systemQueriesMode == common.SystemQueriesModeTarget,
 		forwardAuthToTarget:                  forwardAuthToTarget,
 		targetCredsOnClientRequest:           targetCredsOnClientRequest,
-		queryModifier:                        NewQueryModifier(timeUuidGenerator),
+		queryModifier:                        NewQueryModifier(conf, timeUuidGenerator),
 		parameterModifier:                    NewParameterModifier(timeUuidGenerator),
 		timeUuidGenerator:                    timeUuidGenerator,
 		clientHandlerShutdownRequestCancelFn: clientHandlerShutdownRequestCancelFn,
@@ -1358,25 +1358,22 @@ func (ch *ClientHandler) forwardRequest(request *frame.RawFrame, customResponseC
 	log.Tracef("Request frame: %v", request)
 
 	currentKeyspace := ch.LoadCurrentKeyspace()
-	context := NewFrameDecodeContext(request)
-	var replacedTerms []*statementReplacedTerms
-	var err error
-	if ch.conf.ReplaceCqlFunctions {
-		context, replacedTerms, err = ch.queryModifier.replaceQueryString(currentKeyspace, context)
-	}
+	requestContext := NewFrameDecodeContext(request)
 
+	// Note: Here lies the all encompassing entry point to
+	//		 thee in-flight cql parser and modifier
+	originFrame, targetFrame, err := ch.queryModifier.processAndBifurcate(currentKeyspace, requestContext)
 	if err != nil {
 		return err
 	}
 
-	//originContext := context
-	//targetContext := context
-
+	// TODO: Should account for both origin/target replacedTerms
 	requestInfo, err := buildRequestInfo(
-		context, replacedTerms, ch.preparedStatementCache, ch.metricHandler, currentKeyspace, ch.primaryCluster,
+		requestContext, originFrame.replacedTerms, ch.preparedStatementCache, ch.metricHandler, currentKeyspace, ch.primaryCluster,
 		ch.forwardSystemQueriesToTarget, ch.topologyConfig.VirtualizationEnabled, ch.forwardAuthToTarget, ch.timeUuidGenerator)
 	if err != nil {
-		if errVal, ok := err.(*UnpreparedExecuteError); ok {
+		var errVal *UnpreparedExecuteError
+		if errors.As(err, &errVal) {
 			unpreparedFrame, err := createUnpreparedFrame(errVal)
 			if err != nil {
 				return err
@@ -1394,7 +1391,7 @@ func (ch *ClientHandler) forwardRequest(request *frame.RawFrame, customResponseC
 	}
 
 	requestTimeout := time.Duration(ch.conf.ProxyRequestTimeoutMs) * time.Millisecond
-	err = ch.executeRequest(context, requestInfo, currentKeyspace, overallRequestStartTime, customResponseChannel, requestTimeout)
+	err = ch.executeRequest(originFrame.decodeContext, targetFrame.decodeContext, requestInfo, currentKeyspace, overallRequestStartTime, customResponseChannel, requestTimeout)
 	if err != nil {
 		return err
 	}
@@ -1404,71 +1401,26 @@ func (ch *ClientHandler) forwardRequest(request *frame.RawFrame, customResponseC
 // executeRequest executes the forward decision and waits for one or two responses, then returns the response
 // that should be sent back to the client.
 func (ch *ClientHandler) executeRequest(
-	frameContext *frameDecodeContext, requestInfo RequestInfo, currentKeyspace string,
+	originFrameContext *frameDecodeContext, targetFrameContext *frameDecodeContext, requestInfo RequestInfo, currentKeyspace string,
 	overallRequestStartTime time.Time, customResponseChannel chan *customResponse, requestTimeout time.Duration) error {
 	fwdDecision := requestInfo.GetForwardDecision()
-	log.Tracef("Opcode: %v, Forward decision: %v", frameContext.GetRawFrame().Header.OpCode, fwdDecision)
+	log.Tracef("Opcode: %v, Forward decision: %v", originFrameContext.GetRawFrame().Header.OpCode, fwdDecision)
 
-	originFrame := frameContext.GetRawFrame()
-	targetFrameContext := frameContext
-	fmt.Printf("%s\n", ch.conf.KeyspaceMappings)
-	if len(ch.conf.KeyspaceMappings) != 0 {
-		_, statementsQueryData, err := frameContext.GetOrDecodeAndInspect(currentKeyspace, ch.timeUuidGenerator)
-		if err == nil {
-			newFrame := frameContext.decodedFrame.DeepCopy()
-			newStatementsQueryData := make([]*statementQueryData, 0, len(statementsQueryData))
-			for _, stmtQueryData := range statementsQueryData {
-				targetKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
-				newKeyspace, keyspaceShouldBeReplaced := ch.conf.KeyspaceMappings[targetKeyspace]
-				if keyspaceShouldBeReplaced {
-					fmt.Printf("replacing keyspace %s with %s", targetKeyspace, newKeyspace)
-					newQueryData := stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
-					switch m := newFrame.Body.Message.(type) {
-					case *message.Query:
-						m.Query = strings.ReplaceAll(m.Query, targetKeyspace, newKeyspace)
-					case *message.Prepare:
-						m.Query = strings.ReplaceAll(m.Query, targetKeyspace, newKeyspace)
-						if m.Keyspace != "" {
-							m.Keyspace = newKeyspace
-						}
-					}
-
-					newStatementsQueryData = append(newStatementsQueryData,
-						&statementQueryData{statementIndex: stmtQueryData.statementIndex, queryData: newQueryData})
-				}
-			}
-			//executeMsg, ok := newFrame.Body.Message.(*message.Execute)
-			//newFrame.Body.Message
-			//newFrame.Header
-			//newFrame.Body.Message
-			newRawFrame, err := defaultCodec.ConvertToRawFrame(newFrame)
-			if err != nil {
-				return fmt.Errorf("could not convert modified frame to raw frame: %w", err)
-			}
-			targetFrameContext = NewInitializedFrameDecodeContext(newRawFrame, newFrame, newStatementsQueryData)
-		} else {
-			if !errors.Is(err, NotInspectableErr) {
-				return fmt.Errorf("could not check whether query needs replacement for a '%v' request: %w",
-					frameContext.GetRawFrame().Header.OpCode.String(), err)
-			}
-		}
-	}
-
-	f := frameContext.GetRawFrame()
-	originRequest := originFrame
+	f := originFrameContext.GetRawFrame()
+	originRequest := originFrameContext.GetRawFrame()
 	targetRequest := targetFrameContext.GetRawFrame()
 	var clientResponse *frame.RawFrame
 	var err error
 
 	switch castedRequestInfo := requestInfo.(type) {
 	case *InterceptedRequestInfo:
-		clientResponse, err = ch.handleInterceptedRequest(castedRequestInfo, frameContext, currentKeyspace)
+		clientResponse, err = ch.handleInterceptedRequest(castedRequestInfo, originFrameContext, currentKeyspace)
 	case *PrepareRequestInfo:
-		clientResponse, originRequest, targetRequest, err = ch.handlePrepareRequest(castedRequestInfo, frameContext, targetFrameContext, currentKeyspace)
+		clientResponse, originRequest, targetRequest, err = ch.handlePrepareRequest(castedRequestInfo, originFrameContext, targetFrameContext, currentKeyspace)
 	case *ExecuteRequestInfo:
-		clientResponse, originRequest, targetRequest, err = ch.handleExecuteRequest(castedRequestInfo, frameContext, targetFrameContext, currentKeyspace)
+		clientResponse, originRequest, targetRequest, err = ch.handleExecuteRequest(castedRequestInfo, originFrameContext, targetFrameContext, currentKeyspace)
 	case *BatchRequestInfo:
-		originRequest, targetRequest, err = ch.handleBatchRequest(castedRequestInfo, frameContext, targetFrameContext)
+		originRequest, targetRequest, err = ch.handleBatchRequest(castedRequestInfo, originFrameContext, targetFrameContext)
 	}
 
 	if err != nil {
@@ -1547,7 +1499,8 @@ func (ch *ClientHandler) executeRequest(
 			f.Header.OpCode, f.Header.StreamId, common.ClusterTypeOrigin, common.ClusterTypeTarget)
 		sendErr := ch.originCassandraConnector.sendRequestToCluster(originRequest)
 		if sendErr != nil {
-			ch.handleRequestSendFailure(sendErr, frameContext)
+			// TODO: Should this always be origin frame context?
+			ch.handleRequestSendFailure(sendErr, originFrameContext)
 		} else {
 			ch.targetCassandraConnector.sendRequestToCluster(targetRequest)
 		}
@@ -1556,7 +1509,8 @@ func (ch *ClientHandler) executeRequest(
 			f.Header.OpCode, f.Header.StreamId, common.ClusterTypeOrigin)
 		sendErr := ch.originCassandraConnector.sendRequestToCluster(originRequest)
 		if sendErr != nil {
-			ch.handleRequestSendFailure(sendErr, frameContext)
+			// TODO: Should this always be origin frame context?
+			ch.handleRequestSendFailure(sendErr, originFrameContext)
 		}
 		ch.targetCassandraConnector.sendHeartbeat(startupFrameVersion, ch.conf.HeartbeatIntervalMs)
 	case forwardToTarget:
@@ -1564,7 +1518,8 @@ func (ch *ClientHandler) executeRequest(
 			f.Header.OpCode, f.Header.StreamId, common.ClusterTypeTarget)
 		sendErr := ch.targetCassandraConnector.sendRequestToCluster(targetRequest)
 		if sendErr != nil {
-			ch.handleRequestSendFailure(sendErr, frameContext)
+			// TODO: Should this always be origin frame context?
+			ch.handleRequestSendFailure(sendErr, originFrameContext)
 		}
 		ch.originCassandraConnector.sendHeartbeat(startupFrameVersion, ch.conf.HeartbeatIntervalMs)
 	case forwardToAsyncOnly:
@@ -1580,10 +1535,7 @@ func (ch *ClientHandler) executeRequest(
 	// it can be a request that should ALSO be sent to async as fire and forget
 	// or a request that ONLY needs to be sent to the async connector (and a response is expected, i.e. not fire and forget)
 	// like async connector handshake requests
-
-	return ch.sendToAsyncConnector(
-		frameContext, originRequest, targetRequest, fwdDecision, reqCtx, holder, sendAlsoToAsync,
-		overallRequestStartTime, requestTimeout)
+	return ch.sendToAsyncConnector(originRequest, targetRequest, fwdDecision, reqCtx, holder, sendAlsoToAsync, overallRequestStartTime, requestTimeout)
 }
 
 func (ch *ClientHandler) handleRequestSendFailure(err error, frameContext *frameDecodeContext) {
@@ -1602,7 +1554,7 @@ func (ch *ClientHandler) handleRequestSendFailure(err error, frameContext *frame
 }
 
 func (ch *ClientHandler) handleInterceptedRequest(
-	requestInfo RequestInfo, frameContext *frameDecodeContext, currentKeyspace string) (*frame.RawFrame, error) {
+	requestInfo RequestInfo, originFrameContext *frameDecodeContext, currentKeyspace string) (*frame.RawFrame, error) {
 
 	prepared := false
 	var interceptedRequestInfo *InterceptedRequestInfo
@@ -1620,7 +1572,7 @@ func (ch *ClientHandler) handleInterceptedRequest(
 		}
 	}
 
-	f := frameContext.GetRawFrame()
+	f := originFrameContext.GetRawFrame()
 	interceptedQueryType := interceptedRequestInfo.GetQueryType()
 	var interceptedQueryResponse message.Message
 	var controlConn *ControlConn
@@ -1866,8 +1818,7 @@ func (ch *ClientHandler) handleBatchRequest(
 	return originRequest, targetRequest, nil
 }
 
-func (ch *ClientHandler) sendToAsyncConnector(
-	frameContext *frameDecodeContext, originRequest *frame.RawFrame, targetRequest *frame.RawFrame,
+func (ch *ClientHandler) sendToAsyncConnector(originRequest *frame.RawFrame, targetRequest *frame.RawFrame,
 	fwdDecision forwardDecision, reqCtx *requestContextImpl, holder *requestContextHolder, sendAlsoToAsync bool,
 	overallRequestStartTime time.Time, requestTimeout time.Duration) error {
 	var asyncRequest *frame.RawFrame
@@ -1897,20 +1848,18 @@ func (ch *ClientHandler) sendToAsyncConnector(
 		ch.clientHandlerRequestWaitGroup.Add(1)
 	}
 
-	f := frameContext.GetRawFrame()
-
 	sent := ch.asyncConnector.sendAsyncRequestToCluster(
 		reqCtx.GetRequestInfo(), asyncRequest, !isFireAndForget, overallRequestStartTime, requestTimeout, func() {
 			if !isFireAndForget {
 				ch.closedRespChannelLock.RLock()
 				defer ch.closedRespChannelLock.RUnlock()
 				if ch.closedRespChannel {
-					finished := reqCtx.SetTimeout(ch.nodeMetrics, f)
+					finished := reqCtx.SetTimeout(ch.nodeMetrics, originRequest)
 					if finished {
 						ch.finishRequest(holder, reqCtx)
 					}
 				} else {
-					ch.respChannel <- NewTimeoutResponse(f, true)
+					ch.respChannel <- NewTimeoutResponse(originRequest, true)
 				}
 			} else {
 				ch.clientHandlerRequestWaitGroup.Done()
