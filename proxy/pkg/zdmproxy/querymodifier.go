@@ -38,6 +38,7 @@ func (cache *LazyFrameCache) EnsureCopied() {
 		return
 	}
 	cache.copy = cache.original.DeepCopy()
+	//cache.copy.Header.StreamId
 }
 
 func (cache *LazyFrameCache) Get() *frame.Frame {
@@ -67,8 +68,26 @@ func (recv *QueryModifier) replaceQueryInBatchMessage(
 	replacedStatementIndexes := make([]int, 0)
 
 	for idx, stmtQueryData := range statementsQueryData {
-		if recv.conf.ReplaceCqlFunctions && stmtQueryData.queryData.hasNowFunctionCalls() {
-			newQueryData, replacedTerms := stmtQueryData.queryData.replaceNowFunctionCallsWithLiteral()
+		modified := false
+		newQueryData := stmtQueryData.queryData
+		var replacedTerms []*term
+		if recv.conf.ReplaceCqlFunctions && newQueryData.hasNowFunctionCalls() {
+			newQueryData, replacedTerms = newQueryData.replaceNowFunctionCallsWithLiteral()
+			modified = true
+		}
+
+		if clusterType == common.ClusterTypeTarget && len(recv.conf.KeyspaceMappings) != 0 {
+			queryKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
+			newKeyspace, keyspaceShouldBeReplaced := recv.conf.KeyspaceMappings[queryKeyspace]
+			if keyspaceShouldBeReplaced {
+				log.Infof("Replacing keyspace %s with %s", queryKeyspace, newKeyspace)
+				newQueryData = newQueryData.replaceKeyspaceName(newKeyspace)
+				modified = true
+				// TODO: Replaced terms and such should be modified here
+			}
+		}
+
+		if modified {
 			newStatementsQueryData = append(
 				newStatementsQueryData,
 				&statementQueryData{statementIndex: stmtQueryData.statementIndex, queryData: newQueryData})
@@ -76,22 +95,6 @@ func (recv *QueryModifier) replaceQueryInBatchMessage(
 				statementsReplacedTerms,
 				&statementReplacedTerms{statementIndex: stmtQueryData.statementIndex, replacedTerms: replacedTerms})
 			replacedStatementIndexes = append(replacedStatementIndexes, idx)
-		} else if clusterType == common.ClusterTypeTarget && len(recv.conf.KeyspaceMappings) != 0 {
-			queryKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
-			newKeyspace, keyspaceShouldBeReplaced := recv.conf.KeyspaceMappings[queryKeyspace]
-			if keyspaceShouldBeReplaced {
-				log.Infof("Replacing keyspace %s with %s", queryKeyspace, newKeyspace)
-				newQueryData := stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
-				newStatementsQueryData = append(
-					newStatementsQueryData,
-					&statementQueryData{statementIndex: stmtQueryData.statementIndex, queryData: newQueryData})
-				// TODO: Figure out replaced terms idk
-				statementsReplacedTerms = append(
-					statementsReplacedTerms,
-					&statementReplacedTerms{statementIndex: stmtQueryData.statementIndex, replacedTerms: nil})
-				replacedStatementIndexes = append(replacedStatementIndexes, idx)
-			}
-			newStatementsQueryData = append(newStatementsQueryData, stmtQueryData)
 		} else {
 			newStatementsQueryData = append(newStatementsQueryData, stmtQueryData)
 		}
@@ -147,9 +150,9 @@ func (recv *QueryModifier) replaceQueryInQueryMessage(
 		if keyspaceShouldBeReplaced {
 			log.Infof("Replacing keyspace %s with %s", queryKeyspace, newKeyspace)
 			newQueryData = stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
-			queryMessage := frameCache.Get().Body.Message.(*message.Query)
-			if queryMessage.Options.Keyspace == queryKeyspace {
-				queryMessage.Options.Keyspace = newKeyspace
+			queryMessage := frameCache.EnsureCopiedAndGet().Body.Message.(*message.Query).Options
+			if queryMessage.Keyspace == queryKeyspace {
+				queryMessage.Keyspace = newKeyspace
 			}
 		}
 	}
@@ -194,12 +197,13 @@ func (recv *QueryModifier) replaceQueryInPrepareMessage(
 		if keyspaceShouldBeReplaced {
 			log.Infof("Replacing keyspace %s with %s", queryKeyspace, newKeyspace)
 			newQueryData = stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
-			queryMessage := frameCache.Get().Body.Message.(*message.Prepare)
-			if queryMessage.Keyspace == queryKeyspace {
-				queryMessage.Keyspace = newKeyspace
+			prepareMessage := frameCache.EnsureCopiedAndGet().Body.Message.(*message.Prepare)
+			if prepareMessage.Keyspace == queryKeyspace {
+				prepareMessage.Keyspace = newKeyspace
 			}
 		}
 	}
+	// TODO: Should check replaced terms for modifications instead
 	if !frameCache.IsCopied() {
 		return frameCache.Get(), []*statementReplacedTerms{}, statementsQueryData, nil
 	}

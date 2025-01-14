@@ -1751,21 +1751,24 @@ func (ch *ClientHandler) handleExecuteRequest(
 	return nil, originRequest, targetRequest, nil
 }
 
-// TODO: Fix batching
 func (ch *ClientHandler) handleBatchRequest(
 	castedRequestInfo *BatchRequestInfo, originFrameContext *frameDecodeContext, targetFrameContext *frameDecodeContext) (
 	originRequest *frame.RawFrame, targetRequest *frame.RawFrame, err error) {
 	originRequest = originFrameContext.GetRawFrame()
-	targetRequest = targetFrameContext.GetRawFrame()
-	decodedFrame, err := originFrameContext.GetOrDecodeFrame()
+	originDecodedFrame, err := originFrameContext.GetOrDecodeFrame()
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not decode batch raw frame: %w", err)
+		return nil, nil, fmt.Errorf("could not decode batch target raw frame: %w", err)
+	}
+	targetRequest = targetFrameContext.GetRawFrame()
+	targetDecodedFrame, err := targetFrameContext.GetOrDecodeFrame()
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not decode batch target raw frame: %w", err)
 	}
 
 	var newOriginRequest *frame.Frame
 	var newOriginBatchMsg *message.Batch
 
-	newTargetRequest := decodedFrame.DeepCopy()
+	newTargetRequest := targetDecodedFrame.DeepCopy()
 	newTargetBatchMsg, ok := newTargetRequest.Body.Message.(*message.Batch)
 	if !ok {
 		return nil, nil, fmt.Errorf("expected Batch but got %v instead", newTargetRequest.Body.Message.GetOpCode())
@@ -1775,17 +1778,17 @@ func (ch *ClientHandler) handleBatchRequest(
 		prepareRequestInfo := preparedData.GetPrepareRequestInfo()
 		if len(prepareRequestInfo.GetReplacedTerms()) > 0 {
 			if newOriginRequest == nil {
-				newOriginRequest = decodedFrame.DeepCopy()
+				newOriginRequest = originDecodedFrame.DeepCopy()
 				newOriginBatchMsg, ok = newOriginRequest.Body.Message.(*message.Batch)
 				if !ok {
 					return nil, nil, fmt.Errorf("expected Batch but got %v instead", newOriginRequest.Body.Message.GetOpCode())
 				}
 			}
 			replacementTimeUuids := ch.parameterModifier.generateTimeUuids(prepareRequestInfo)
-			err = ch.parameterModifier.addValuesToBatchChild(decodedFrame.Header.Version, newTargetBatchMsg.Children[stmtIdx],
+			err = ch.parameterModifier.addValuesToBatchChild(targetDecodedFrame.Header.Version, newTargetBatchMsg.Children[stmtIdx],
 				preparedData.GetPrepareRequestInfo(), preparedData.GetTargetVariablesMetadata(), replacementTimeUuids)
 			if err == nil && newOriginBatchMsg != nil {
-				err = ch.parameterModifier.addValuesToBatchChild(decodedFrame.Header.Version, newOriginBatchMsg.Children[stmtIdx],
+				err = ch.parameterModifier.addValuesToBatchChild(originDecodedFrame.Header.Version, newOriginBatchMsg.Children[stmtIdx],
 					preparedData.GetPrepareRequestInfo(), preparedData.GetOriginVariablesMetadata(), replacementTimeUuids)
 			}
 			if err != nil {
