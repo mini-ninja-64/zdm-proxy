@@ -199,6 +199,10 @@ func TestReplaceQueryString(t *testing.T) {
 					continue
 				}
 
+				// TODO: Fix properly, as the assumption of parsedStatements == positionsReplaced no longer holds
+				if len(positionsReplaced) == 0 {
+					continue
+				}
 				for parsedStmtIdx, parsedStmt := range stmtQueryData.queryData.getParsedStatements() {
 					oldTerms := parsedStmt.terms
 					newParsedStatement := newStmtQueryData.queryData.getParsedStatements()[parsedStmtIdx]

@@ -77,13 +77,12 @@ func (recv *QueryModifier) replaceQueryInBatchMessage(
 		}
 
 		if clusterType == common.ClusterTypeTarget && len(recv.conf.KeyspaceMappings) != 0 {
-			queryKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
-			newKeyspace, keyspaceShouldBeReplaced := recv.conf.KeyspaceMappings[queryKeyspace]
-			if keyspaceShouldBeReplaced {
-				log.Infof("Replacing keyspace %s with %s", queryKeyspace, newKeyspace)
-				newQueryData = newQueryData.replaceKeyspaceName(newKeyspace)
-				modified = true
-				// TODO: Replaced terms and such should be modified here
+			for oldKeyspace, newKeyspace := range recv.conf.KeyspaceMappings {
+				if newQueryData.hasKeyspace(oldKeyspace) {
+					log.Infof("Replacing keyspace %s with %s", oldKeyspace, newKeyspace)
+					newQueryData = newQueryData.replaceKeyspace(oldKeyspace, newKeyspace)
+					modified = true
+				}
 			}
 		}
 
@@ -146,13 +145,14 @@ func (recv *QueryModifier) replaceQueryInQueryMessage(
 
 	if clusterType == common.ClusterTypeTarget && len(recv.conf.KeyspaceMappings) != 0 {
 		queryKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
-		newKeyspace, keyspaceShouldBeReplaced := recv.conf.KeyspaceMappings[queryKeyspace]
-		if keyspaceShouldBeReplaced {
-			log.Infof("Replacing keyspace %s with %s", queryKeyspace, newKeyspace)
-			newQueryData = stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
-			queryMessage := frameCache.EnsureCopiedAndGet().Body.Message.(*message.Query).Options
-			if queryMessage.Keyspace == queryKeyspace {
-				queryMessage.Keyspace = newKeyspace
+		for oldKeyspace, newKeyspace := range recv.conf.KeyspaceMappings {
+			if newQueryData.hasKeyspace(oldKeyspace) {
+				log.Infof("Replacing keyspace %s with %s", oldKeyspace, newKeyspace)
+				newQueryData = newQueryData.replaceKeyspace(oldKeyspace, newKeyspace)
+				queryMessage := frameCache.EnsureCopiedAndGet().Body.Message.(*message.Query).Options
+				if queryMessage.Keyspace == queryKeyspace {
+					queryMessage.Keyspace = newKeyspace
+				}
 			}
 		}
 	}
@@ -192,18 +192,17 @@ func (recv *QueryModifier) replaceQueryInPrepareMessage(
 	}
 
 	if clusterType == common.ClusterTypeTarget && len(recv.conf.KeyspaceMappings) != 0 {
-		queryKeyspace := stmtQueryData.queryData.getApplicableKeyspace()
-		newKeyspace, keyspaceShouldBeReplaced := recv.conf.KeyspaceMappings[queryKeyspace]
-		if keyspaceShouldBeReplaced {
-			log.Infof("Replacing keyspace %s with %s", queryKeyspace, newKeyspace)
-			newQueryData = stmtQueryData.queryData.replaceKeyspaceName(newKeyspace)
-			prepareMessage := frameCache.EnsureCopiedAndGet().Body.Message.(*message.Prepare)
-			if prepareMessage.Keyspace == queryKeyspace {
-				prepareMessage.Keyspace = newKeyspace
+		for oldKeyspace, newKeyspace := range recv.conf.KeyspaceMappings {
+			if newQueryData.hasKeyspace(oldKeyspace) {
+				log.Infof("Replacing keyspace %s with %s", oldKeyspace, newKeyspace)
+				newQueryData = stmtQueryData.queryData.replaceKeyspace(oldKeyspace, newKeyspace)
+				prepareMessage := frameCache.EnsureCopiedAndGet().Body.Message.(*message.Prepare)
+				if prepareMessage.Keyspace == oldKeyspace {
+					prepareMessage.Keyspace = newKeyspace
+				}
 			}
 		}
 	}
-	// TODO: Should check replaced terms for modifications instead
 	if !frameCache.IsCopied() {
 		return frameCache.Get(), []*statementReplacedTerms{}, statementsQueryData, nil
 	}

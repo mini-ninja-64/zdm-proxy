@@ -14,7 +14,6 @@ type statementType string
 type replacementType int
 
 const (
-	// TODO: Maybe should support create?
 	statementTypeInsert = statementType("insert")
 	statementTypeUpdate = statementType("update")
 	statementTypeDelete = statementType("delete")
@@ -61,11 +60,8 @@ type QueryInfo interface {
 	// when this request was parsed (getRequestKeyspace()).
 	getApplicableKeyspace() string
 
-	// Below methods are only relevant for INSERT statements,
-	// or BATCH statements containing INSERT statements.
-
 	// Returns a slice of parsedStatement. There is one parsedStatement per statement in the query.
-	// For a single SELECT/INSERT/UPDATE/DELETE, the slice contains only one element. For BATCH statements,
+	// For a single USE/SELECT/INSERT/UPDATE/DELETE, the slice contains only one element. For BATCH statements,
 	// the slice will contain as many elements as there are child statements.
 	getParsedStatements() []*parsedStatement
 
@@ -90,7 +86,8 @@ type QueryInfo interface {
 	replaceNowFunctionCallsWithLiteral() (QueryInfo, []*term)
 	replaceNowFunctionCallsWithPositionalBindMarkers() (QueryInfo, []*term)
 	replaceNowFunctionCallsWithNamedBindMarkers() (QueryInfo, []*term)
-	replaceKeyspaceName(keyspace string) QueryInfo
+	hasKeyspace(keyspace string) bool
+	replaceKeyspace(oldKeyspace string, newKeyspace string) QueryInfo
 }
 
 func inspectCqlQuery(query string, currentKeyspace string, timeUuidGenerator TimeUuidGenerator) QueryInfo {
@@ -134,13 +131,33 @@ func (f *functionCall) isNow() bool {
 	return (f.keyspace == "" || f.keyspace == systemKeyspaceName) && f.name == nowFunctionName && f.arity == 0
 }
 
+type IdentifierInfo struct {
+	startIndex        int
+	stopIndex         int
+	internalForm      string
+	quoted            bool
+	unreservedKeyword bool
+}
+
+func (recv *IdentifierInfo) Clone() *IdentifierInfo {
+	return &IdentifierInfo{
+		startIndex:        recv.startIndex,
+		stopIndex:         recv.stopIndex,
+		internalForm:      recv.internalForm,
+		quoted:            recv.quoted,
+		unreservedKeyword: recv.unreservedKeyword,
+	}
+}
+
 // parsedStatement contains all the information stored by the cqlListener while processing a particular statement.
 type parsedStatement struct {
-	// The zero-based index of the statement. For single INSERT/UPDATE/DELETE statements, this will be zero. For BATCH child
+	// The zero-based index of the statement. For single USE/SELECT/INSERT/UPDATE/DELETE statements, this will be zero. For BATCH child
 	// statements, this will be the child index.
 	statementIndex int
 	statementType  statementType
 	terms          []*term
+	keyspace       *IdentifierInfo
+	table          *IdentifierInfo
 }
 
 func (recv *parsedStatement) ShallowClone() *parsedStatement {
@@ -148,6 +165,8 @@ func (recv *parsedStatement) ShallowClone() *parsedStatement {
 		statementIndex: recv.statementIndex,
 		statementType:  recv.statementType,
 		terms:          recv.terms,
+		keyspace:       recv.keyspace,
+		table:          recv.table,
 	}
 }
 
@@ -309,13 +328,15 @@ type cqlListener struct {
 	*parser.BaseSimplifiedCqlListener
 	query         string
 	statementType statementType
-	keyspaceName  string
-	tableName     string
+
+	// TODO: technically can be removed now, as not required anymore due to always being in parsedStatements
+	keyspaceName string
+	tableName    string
 
 	// Only filled in for SELECT statements on system.local or system.peers tables
 	parsedSelectClause *selectClause
 
-	// Only filled in for INSERT, DELETE, UPDATE and BATCH statements
+	// Only filled in for USE, SELECT, INSERT, DELETE, UPDATE and BATCH statements
 	parsedStatements      []*parsedStatement
 	positionalBindMarkers bool
 	namedBindMarkers      bool
@@ -328,6 +349,8 @@ type cqlListener struct {
 	timeUuidGenerator TimeUuidGenerator
 
 	requestKeyspace string
+
+	keyspaceIdents []*term
 }
 
 func (l *cqlListener) getQuery() string {
@@ -437,7 +460,13 @@ func (l *cqlListener) ExitSelectStatement(ctx *parser.SelectStatementContext) {
 }
 
 func (l *cqlListener) EnterInsertStatement(ctx *parser.InsertStatementContext) {
-	parsedStmt := &parsedStatement{statementIndex: l.currentBatchChildIndex, statementType: statementTypeInsert}
+	keyspace, table := extractTableName(ctx.TableName().(*parser.TableNameContext))
+	parsedStmt := &parsedStatement{
+		statementIndex: l.currentBatchChildIndex,
+		statementType:  statementTypeInsert,
+		keyspace:       keyspace,
+		table:          table,
+	}
 	for _, childCtx := range ctx.GetChildren() {
 		switch childCtx.(type) {
 		case parser.ITermsContext:
@@ -452,8 +481,13 @@ func (l *cqlListener) EnterInsertStatement(ctx *parser.InsertStatementContext) {
 }
 
 func (l *cqlListener) EnterUpdateStatement(ctx *parser.UpdateStatementContext) {
-	parsedStmt := &parsedStatement{statementIndex: l.currentBatchChildIndex, statementType: statementTypeUpdate}
-
+	keyspace, table := extractTableName(ctx.TableName().(*parser.TableNameContext))
+	parsedStmt := &parsedStatement{
+		statementIndex: l.currentBatchChildIndex,
+		statementType:  statementTypeUpdate,
+		keyspace:       keyspace,
+		table:          table,
+	}
 	for _, childCtx := range ctx.GetChildren() {
 		switch childCtx.(type) {
 		case parser.IUsingClauseContext:
@@ -481,7 +515,13 @@ func (l *cqlListener) EnterUpdateStatement(ctx *parser.UpdateStatementContext) {
 }
 
 func (l *cqlListener) EnterDeleteStatement(ctx *parser.DeleteStatementContext) {
-	parsedStmt := &parsedStatement{statementIndex: l.currentBatchChildIndex, statementType: statementTypeDelete}
+	keyspace, table := extractTableName(ctx.TableName().(*parser.TableNameContext))
+	parsedStmt := &parsedStatement{
+		statementIndex: l.currentBatchChildIndex,
+		statementType:  statementTypeDelete,
+		keyspace:       keyspace,
+		table:          table,
+	}
 
 	for _, childCtx := range ctx.GetChildren() {
 		switch childCtx.(type) {
@@ -522,22 +562,57 @@ func (l *cqlListener) EnterBatchStatement(ctx *parser.BatchStatementContext) {
 	}
 }
 
-func (l *cqlListener) EnterUseStatement(ctx *parser.UseStatementContext) {
-	l.keyspaceName = extractIdentifier(ctx.KeyspaceName().(*parser.KeyspaceNameContext).Identifier().(*parser.IdentifierContext))
+func (l *cqlListener) EnterSelectStatement(ctx *parser.SelectStatementContext) {
+	keyspace, table := extractTableName(ctx.TableName().(*parser.TableNameContext))
+	// Note: SELECT statements cannot be batched, so statementIndex will always be 0
+	parsedStmt := &parsedStatement{
+		statementIndex: 0,
+		statementType:  statementTypeSelect,
+		keyspace:       keyspace,
+		table:          table,
+	}
+	l.parsedStatements = append(l.parsedStatements, parsedStmt)
 }
 
-func (l *cqlListener) EnterTableName(ctx *parser.TableNameContext) {
+func (l *cqlListener) EnterUseStatement(ctx *parser.UseStatementContext) {
+	keyspaceIdentifier := ctx.KeyspaceName().(*parser.KeyspaceNameContext).Identifier().(*parser.IdentifierContext)
+	keyspace := extractIdentifier(keyspaceIdentifier)
+	// Note: USE statements cannot be batched, so statementIndex will always be 0
+	parsedStmt := &parsedStatement{
+		statementIndex: 0,
+		statementType:  statementTypeUse,
+		keyspace:       keyspace,
+	}
+	l.keyspaceName = keyspace.internalForm
+	l.parsedStatements = append(l.parsedStatements, parsedStmt)
+}
+
+func extractTableName(ctx *parser.TableNameContext) (*IdentifierInfo, *IdentifierInfo) {
+	var keyspace *IdentifierInfo
+	var table *IdentifierInfo
+
 	qualifiedId := ctx.GetChild(0)
 	// Note: this will capture the *last* table name in a BATCH statement
 	if qualifiedId.GetChildCount() == 1 {
 		identifierContext := qualifiedId.GetChild(0).(*parser.IdentifierContext)
-		l.tableName = extractIdentifier(identifierContext)
+		table = extractIdentifier(identifierContext)
 	} else {
 		// 3 children: keyspaceName, token DOT, identifier
 		keyspaceNameContext := qualifiedId.GetChild(0)
-		l.keyspaceName = extractIdentifier(keyspaceNameContext.GetChild(0).(*parser.IdentifierContext))
+		keyspace = extractIdentifier(keyspaceNameContext.GetChild(0).(*parser.IdentifierContext))
 		identifierContext := qualifiedId.GetChild(2).(*parser.IdentifierContext)
-		l.tableName = extractIdentifier(identifierContext)
+		table = extractIdentifier(identifierContext)
+	}
+	return keyspace, table
+}
+
+func (l *cqlListener) EnterTableName(ctx *parser.TableNameContext) {
+	keyspace, table := extractTableName(ctx)
+	if keyspace != nil {
+		l.keyspaceName = keyspace.internalForm
+	}
+	if table != nil {
+		l.tableName = table.internalForm
 	}
 }
 
@@ -578,7 +653,7 @@ func extractSelector(selectorCtx *parser.SelectorContext) (selector, error) {
 	unaliasedSelector := selectorCtx.GetChild(0).(*parser.UnaliasedSelectorContext)
 	switch unaliasedSelectorChild := unaliasedSelector.GetChild(0).(type) {
 	case *parser.IdentifierContext:
-		parsedSelector = &idSelector{name: extractIdentifier(unaliasedSelectorChild)}
+		parsedSelector = &idSelector{name: extractIdentifier(unaliasedSelectorChild).internalForm}
 	case *parser.TermContext:
 		return nil, fmt.Errorf("term selector (%v) not supported", unaliasedSelectorChild.GetText())
 	case antlr.TerminalNode:
@@ -591,7 +666,7 @@ func extractSelector(selectorCtx *parser.SelectorContext) (selector, error) {
 	if selectorCtx.GetChildCount() == 3 {
 		return &aliasedSelector{
 			selector: parsedSelector,
-			alias:    extractIdentifier(selectorCtx.GetChild(2).(*parser.IdentifierContext)),
+			alias:    extractIdentifier(selectorCtx.GetChild(2).(*parser.IdentifierContext)).internalForm,
 		}, nil
 	} else {
 		return parsedSelector, nil
@@ -658,7 +733,7 @@ func (l *cqlListener) extractBindMarker(bindMarkerCtx antlr.Tree) *term {
 			return newTerm
 		case parser.INamedBindMarkerContext:
 			l.namedBindMarkers = true
-			bindMarkerName := extractIdentifier(childCtx.GetChild(1).(*parser.IdentifierContext))
+			bindMarkerName := extractIdentifier(childCtx.GetChild(1).(*parser.IdentifierContext)).internalForm
 			return NewNamedBindMarkerTerm(bindMarkerName, l.currentPositionalIndex-1)
 		}
 	}
@@ -763,10 +838,10 @@ func extractFunctionCall(ctx *parser.FunctionCallContext) *functionCall {
 	keyspaceName := ""
 	functionNameChildIdx := 0
 	if qualifiedIdentifierCtx.GetChildCount() > 1 {
-		keyspaceName = extractIdentifier(qualifiedIdentifierCtx.GetChild(0).GetChild(0).(*parser.IdentifierContext))
+		keyspaceName = extractIdentifier(qualifiedIdentifierCtx.GetChild(0).GetChild(0).(*parser.IdentifierContext)).internalForm
 		functionNameChildIdx = 2
 	}
-	functionName := extractIdentifier(qualifiedIdentifierCtx.GetChild(functionNameChildIdx).(*parser.IdentifierContext))
+	functionName := extractIdentifier(qualifiedIdentifierCtx.GetChild(functionNameChildIdx).(*parser.IdentifierContext)).internalForm
 	// For now we only record the function arity, not the actual function arguments
 	functionArity := 0
 	if ctx.GetChildCount() == 4 {
@@ -782,10 +857,10 @@ func extractFunctionCall(ctx *parser.FunctionCallContext) *functionCall {
 		stop)
 }
 
-// Returns the identifier in the context object, in its internal form.
+// Returns info about the identifier in the context object.
 // For unquoted identifiers and unreserved keywords, the internal form is the form in full lower case;
 // for quoted ones, the internal form is the unquoted string, in its exact case.
-func extractIdentifier(identifierContext *parser.IdentifierContext) string {
+func extractIdentifier(identifierContext *parser.IdentifierContext) *IdentifierInfo {
 	childCtx := identifierContext.GetChild(0)
 	switch typedChildCtx := childCtx.(type) {
 	case antlr.TerminalNode:
@@ -796,15 +871,30 @@ func extractIdentifier(identifierContext *parser.IdentifierContext) string {
 			identifier = identifier[1 : len(identifier)-1]
 			// handle escaped double-quotes
 			identifier = strings.ReplaceAll(identifier, "\"\"", "\"")
-			return identifier
+			return &IdentifierInfo{
+				startIndex:   identifierContext.GetStart().GetStart(),
+				stopIndex:    identifierContext.GetStart().GetStop(),
+				internalForm: identifier,
+				quoted:       true,
+			}
 		default: // UNQUOTED
-			return strings.ToLower(typedChildCtx.GetText())
+			return &IdentifierInfo{
+				startIndex:   identifierContext.GetStart().GetStart(),
+				stopIndex:    identifierContext.GetStart().GetStop(),
+				internalForm: strings.ToLower(typedChildCtx.GetText()),
+			}
 		}
 	default: // UNRESERVED KEYWORD
-		return strings.ToLower(childCtx.(*parser.UnreservedKeywordContext).GetText())
+		return &IdentifierInfo{
+			startIndex:        identifierContext.GetStart().GetStart(),
+			stopIndex:         identifierContext.GetStart().GetStop(),
+			internalForm:      strings.ToLower(childCtx.(*parser.UnreservedKeywordContext).GetText()),
+			unreservedKeyword: true,
+		}
 	}
 }
 
+// TODO: Check if this needs to fix offsets or if function calls WILL ALWAYS come after keyspace names
 func (l *cqlListener) replaceFunctionCalls(replacementFunc func(query string, functionCall *functionCall) (string, replacementType)) (QueryInfo, []*term) {
 	if !l.hasNowFunctionCalls() {
 		return l, make([]*term, 0)
@@ -891,16 +981,65 @@ func (l *cqlListener) replaceNowFunctionCallsWithNamedBindMarkers() (QueryInfo, 
 	})
 }
 
-func (l *cqlListener) replaceKeyspaceName(newKeyspaceName string) QueryInfo {
-	if l.keyspaceName == "" {
-		return l
+// TODO: Add support for function call keyspace replacement
+func (l *cqlListener) hasKeyspace(keyspace string) bool {
+	if l.getApplicableKeyspace() == keyspace {
+		return true
 	}
 
-	newQueryInfo := l.shallowClone()
-	currentKeyspace := newQueryInfo.keyspaceName
-	newQueryInfo.keyspaceName = newKeyspaceName
+	// Check all nested expressions
+	for _, parsedStmt := range l.parsedStatements {
+		if parsedStmt.keyspace != nil && parsedStmt.keyspace.internalForm == keyspace {
+			return true
+		}
+	}
+	return false
+}
 
-	newQueryInfo.query = strings.ReplaceAll(newQueryInfo.query, currentKeyspace, newKeyspaceName)
+func (l *cqlListener) replaceKeyspace(oldKeyspace string, newKeyspace string) QueryInfo {
+	if oldKeyspace == newKeyspace {
+		return l
+	}
+	newQueryInfo := l.shallowClone()
+
+	if l.requestKeyspace == oldKeyspace {
+		newQueryInfo.requestKeyspace = newKeyspace
+	}
+
+	if l.keyspaceName == oldKeyspace {
+		newQueryInfo.keyspaceName = newKeyspace
+	}
+
+	// TODO: Case sensitivity
+	//if strings.ToLower(newKeyspace) != newKeyspace {
+	//	newKeyspace = "\"" + newKeyspace + "\""
+	//}
+
+	for i, parsedStmt := range newQueryInfo.parsedStatements {
+		if parsedStmt.keyspace == nil {
+			continue
+		}
+		// TODO: Not accounting for character index drift in batched calls
+		keyspace := parsedStmt.keyspace
+
+		if keyspace.internalForm == oldKeyspace {
+			var sb strings.Builder
+			sb.WriteString(newQueryInfo.query[0:keyspace.startIndex])
+			sb.WriteString(newKeyspace)
+			sb.WriteString(newQueryInfo.query[keyspace.stopIndex+1:])
+
+			newQueryInfo.query = sb.String()
+
+			newKeyspaceLength := len(newKeyspace)
+
+			newParsedStmt := parsedStmt.ShallowClone()
+			newKeyspaceIdentifier := keyspace.Clone()
+			newKeyspaceIdentifier.stopIndex = newKeyspaceIdentifier.startIndex + newKeyspaceLength
+			newParsedStmt.keyspace = newKeyspaceIdentifier
+			newQueryInfo.parsedStatements[i] = newParsedStmt
+		}
+	}
+
 	return newQueryInfo
 }
 
