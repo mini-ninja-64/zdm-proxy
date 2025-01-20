@@ -139,6 +139,21 @@ type IdentifierInfo struct {
 	unreservedKeyword bool
 }
 
+func (recv *IdentifierInfo) FullLength() int {
+	baseLen := len(recv.internalForm)
+	if recv.quoted {
+		baseLen += 2
+	}
+	return baseLen
+}
+
+func (recv *IdentifierInfo) Move(offset int) *IdentifierInfo {
+	newIdent := recv.Clone()
+	newIdent.startIndex += offset
+	newIdent.stopIndex += offset
+	return newIdent
+}
+
 func (recv *IdentifierInfo) Clone() *IdentifierInfo {
 	return &IdentifierInfo{
 		startIndex:        recv.startIndex,
@@ -1010,33 +1025,31 @@ func (l *cqlListener) replaceKeyspace(oldKeyspace string, newKeyspace string) Qu
 		newQueryInfo.keyspaceName = newKeyspace
 	}
 
-	// TODO: Case sensitivity
-	//if strings.ToLower(newKeyspace) != newKeyspace {
-	//	newKeyspace = "\"" + newKeyspace + "\""
-	//}
+	if strings.ToLower(newKeyspace) != newKeyspace {
+		newKeyspace = "\"" + newKeyspace + "\""
+	}
 
+	totalCharDrift := 0
 	for i, parsedStmt := range newQueryInfo.parsedStatements {
 		if parsedStmt.keyspace == nil {
 			continue
 		}
-		// TODO: Not accounting for character index drift in batched calls
-		keyspace := parsedStmt.keyspace
 
-		if keyspace.internalForm == oldKeyspace {
-			var sb strings.Builder
-			sb.WriteString(newQueryInfo.query[0:keyspace.startIndex])
-			sb.WriteString(newKeyspace)
-			sb.WriteString(newQueryInfo.query[keyspace.stopIndex+1:])
+		keyspaceIdent := parsedStmt.keyspace
+		newKeyspaceLength := len(newKeyspace)
+		newKeyspaceIdent := keyspaceIdent.Move(totalCharDrift)
 
-			newQueryInfo.query = sb.String()
+		newParsedStmt := parsedStmt.ShallowClone()
+		newParsedStmt.keyspace = newKeyspaceIdent
+		newQueryInfo.parsedStatements[i] = newParsedStmt
 
-			newKeyspaceLength := len(newKeyspace)
+		if newKeyspaceIdent.internalForm == oldKeyspace {
+			newQueryInfo.query = newQueryInfo.query[0:newKeyspaceIdent.startIndex] +
+				newKeyspace +
+				newQueryInfo.query[newKeyspaceIdent.stopIndex+1:]
 
-			newParsedStmt := parsedStmt.ShallowClone()
-			newKeyspaceIdentifier := keyspace.Clone()
-			newKeyspaceIdentifier.stopIndex = newKeyspaceIdentifier.startIndex + newKeyspaceLength
-			newParsedStmt.keyspace = newKeyspaceIdentifier
-			newQueryInfo.parsedStatements[i] = newParsedStmt
+			newKeyspaceIdent.stopIndex = newKeyspaceIdent.startIndex + newKeyspaceLength
+			totalCharDrift += newKeyspaceLength - newKeyspaceIdent.FullLength()
 		}
 	}
 
