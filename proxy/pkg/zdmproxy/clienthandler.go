@@ -120,6 +120,16 @@ type ClientHandler struct {
 	clientHandlerShutdownRequestCancelFn context.CancelFunc
 
 	clientHandlerShutdownRequestContext context.Context
+
+	responseKeyspaceMappings map[string]string
+}
+
+func flipMap[K comparable, V comparable](toFlip map[K]V) map[V]K {
+	flipped := make(map[V]K, len(toFlip))
+	for k, v := range toFlip {
+		flipped[v] = k
+	}
+	return flipped
 }
 
 func NewClientHandler(
@@ -322,6 +332,7 @@ func NewClientHandler(
 		timeUuidGenerator:                    timeUuidGenerator,
 		clientHandlerShutdownRequestCancelFn: clientHandlerShutdownRequestCancelFn,
 		clientHandlerShutdownRequestContext:  clientHandlerShutdownRequestContext,
+		responseKeyspaceMappings:             flipMap(conf.KeyspaceMappings),
 	}, nil
 }
 
@@ -888,7 +899,23 @@ func (ch *ClientHandler) processClientResponse(
 			if bodyMsg.Keyspace == "" {
 				log.Warnf("unexpected set keyspace empty")
 			} else {
-				ch.StoreCurrentKeyspace(bodyMsg.Keyspace)
+				var newResponseKeyspace string
+				// Note: Only important when the response is actually sent to a target and as keyspace replacement
+				//		 only occurs in origin -> target direction, we can gate on primary cluster being set to target
+				if ch.primaryCluster == common.ClusterTypeTarget {
+					oldKeyspace, shouldReplace := ch.responseKeyspaceMappings[bodyMsg.Keyspace]
+					if shouldReplace {
+						newResponseKeyspace = oldKeyspace
+					}
+				}
+
+				if newResponseKeyspace == "" {
+					newResponseKeyspace = bodyMsg.Keyspace
+				} else {
+					newFrame = decodedFrame.DeepCopy()
+					newFrame.Body.Message.(*message.SetKeyspaceResult).Keyspace = newResponseKeyspace
+				}
+				ch.StoreCurrentKeyspace(newResponseKeyspace)
 			}
 		case *message.Unprepared:
 			var unpreparedId []byte
@@ -1499,7 +1526,6 @@ func (ch *ClientHandler) executeRequest(
 			f.Header.OpCode, f.Header.StreamId, common.ClusterTypeOrigin, common.ClusterTypeTarget)
 		sendErr := ch.originCassandraConnector.sendRequestToCluster(originRequest)
 		if sendErr != nil {
-			// TODO: Should this always be origin frame context?
 			ch.handleRequestSendFailure(sendErr, originFrameContext)
 		} else {
 			ch.targetCassandraConnector.sendRequestToCluster(targetRequest)
