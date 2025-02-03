@@ -1535,7 +1535,6 @@ func (ch *ClientHandler) executeRequest(
 			f.Header.OpCode, f.Header.StreamId, common.ClusterTypeOrigin)
 		sendErr := ch.originCassandraConnector.sendRequestToCluster(originRequest)
 		if sendErr != nil {
-			// TODO: Should this always be origin frame context?
 			ch.handleRequestSendFailure(sendErr, originFrameContext)
 		}
 		ch.targetCassandraConnector.sendHeartbeat(startupFrameVersion, ch.conf.HeartbeatIntervalMs)
@@ -1544,7 +1543,6 @@ func (ch *ClientHandler) executeRequest(
 			f.Header.OpCode, f.Header.StreamId, common.ClusterTypeTarget)
 		sendErr := ch.targetCassandraConnector.sendRequestToCluster(targetRequest)
 		if sendErr != nil {
-			// TODO: Should this always be origin frame context?
 			ch.handleRequestSendFailure(sendErr, originFrameContext)
 		}
 		ch.originCassandraConnector.sendHeartbeat(startupFrameVersion, ch.conf.HeartbeatIntervalMs)

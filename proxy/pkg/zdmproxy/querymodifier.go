@@ -53,7 +53,6 @@ func (cache *LazyFrameCache) EnsureCopiedAndGet() *frame.Frame {
 	return cache.Get()
 }
 
-// TODO: hmmmm this feels gut feeling their might be a bug in here
 func (recv *QueryModifier) replaceQueryInBatchMessage(
 	decodedFrame *frame.Frame,
 	statementsQueryData []*statementQueryData,

@@ -87,6 +87,7 @@ type QueryInfo interface {
 	replaceNowFunctionCallsWithPositionalBindMarkers() (QueryInfo, []*term)
 	replaceNowFunctionCallsWithNamedBindMarkers() (QueryInfo, []*term)
 	hasKeyspace(keyspace string) bool
+	// TODO: Although not required, should really generate replaced terms for consistency
 	replaceKeyspace(oldKeyspace string, newKeyspace string) QueryInfo
 }
 
