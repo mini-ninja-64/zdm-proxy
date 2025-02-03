@@ -1387,14 +1387,13 @@ func (ch *ClientHandler) forwardRequest(request *frame.RawFrame, customResponseC
 	currentKeyspace := ch.LoadCurrentKeyspace()
 	requestContext := NewFrameDecodeContext(request)
 
-	// Note: Here lies the all encompassing entry point to
-	//		 thee in-flight cql parser and modifier
+	// Note: Entry point to the in-flight cql parser and modifier, used for rewriting requests
 	originFrame, targetFrame, err := ch.queryModifier.processAndBifurcate(currentKeyspace, requestContext)
 	if err != nil {
 		return err
 	}
 
-	// TODO: Should account for both origin/target replacedTerms
+	// TODO: Should this account for both origin/target replacedTerms?
 	requestInfo, err := buildRequestInfo(
 		requestContext, originFrame.replacedTerms, ch.preparedStatementCache, ch.metricHandler, currentKeyspace, ch.primaryCluster,
 		ch.forwardSystemQueriesToTarget, ch.topologyConfig.VirtualizationEnabled, ch.forwardAuthToTarget, ch.timeUuidGenerator)

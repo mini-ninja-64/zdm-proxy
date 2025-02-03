@@ -38,7 +38,6 @@ func (cache *LazyFrameCache) EnsureCopied() {
 		return
 	}
 	cache.copy = cache.original.DeepCopy()
-	//cache.copy.Header.StreamId
 }
 
 func (cache *LazyFrameCache) Get() *frame.Frame {

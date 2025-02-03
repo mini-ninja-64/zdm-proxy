@@ -583,6 +583,8 @@ func TestNowFunctionCalls(t *testing.T) {
 	}
 }
 
+// TODO: Test keyspace replacement
+
 type fakeTimeUuidGenerator struct {
 	uid uuid.UUID
 }

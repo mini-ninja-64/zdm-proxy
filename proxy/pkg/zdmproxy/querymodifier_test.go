@@ -10,6 +10,8 @@ import (
 )
 
 // TODO: Should check target frame too, should check keyspace translations
+// TODO: [Pre-existing improvement] There is no OpCodeQuery BATCH statement testing
+// TODO: [Pre-existing improvement] There is no testing that the frames raw query actually got modified? only terms??
 func TestReplaceQueryString(t *testing.T) {
 	tests := []struct {
 		name                 string
@@ -207,11 +209,11 @@ func TestReplaceQueryString(t *testing.T) {
 					oldTerms := parsedStmt.terms
 					newParsedStatement := newStmtQueryData.queryData.getParsedStatements()[parsedStmtIdx]
 					newTerms := newParsedStatement.terms
-					positionsReplaced := positionsReplaced[parsedStmtIdx]
+					expectedPositionsReplaced := positionsReplaced[parsedStmtIdx]
 					require.Equal(t, len(oldTerms), len(newTerms))
 					for termIdx, oldTerm := range oldTerms {
 						newTerm := newTerms[termIdx]
-						if contains(positionsReplaced, termIdx) {
+						if contains(expectedPositionsReplaced, termIdx) {
 							require.NotEqual(t, oldTerm, newTerm)
 							require.True(t, oldTerm.isFunctionCall())
 							require.False(t, newTerm.isFunctionCall())
