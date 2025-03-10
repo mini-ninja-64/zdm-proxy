@@ -891,7 +891,7 @@ func (ch *ClientHandler) processClientResponse(
 
 		switch bodyMsg := decodedFrame.Body.Message.(type) {
 		case *message.PreparedResult:
-			newFrame, err = ch.processPreparedResponse(decodedFrame, bodyMsg, reqCtx)
+			newFrame, err = ch.processPreparedResponse(decodedFrame, bodyMsg, reqCtx, responseClusterType)
 			if err != nil {
 				return nil, fmt.Errorf("failed to handle prepared result: %w", err)
 			}
@@ -960,7 +960,7 @@ func (ch *ClientHandler) processClientResponse(
 }
 
 func (ch *ClientHandler) processPreparedResponse(
-	response *frame.Frame, bodyMsg *message.PreparedResult, reqCtx *requestContextImpl) (*frame.Frame, error) {
+	response *frame.Frame, bodyMsg *message.PreparedResult, reqCtx *requestContextImpl, responseClusterType common.ClusterType) (*frame.Frame, error) {
 	if bodyMsg.PreparedQueryId == nil {
 		return nil, errors.New("unexpected prepared query id nil")
 	} else if reqCtx.requestInfo == nil {
@@ -980,8 +980,12 @@ func (ch *ClientHandler) processPreparedResponse(
 			return nil, fmt.Errorf("expected PREPARED RESULT targetBody in target result response but got %T", targetBody.Message)
 		}
 
+		preparedStatementInfo := prepareRequestInfo.originPreparedStatementInfo
+		if responseClusterType == common.ClusterTypeTarget {
+			preparedStatementInfo = prepareRequestInfo.targetPreparedStatementInfo
+		}
 		newResponse := response
-		if len(prepareRequestInfo.replacedTerms) > 0 {
+		if len(preparedStatementInfo.replacedTerms) > 0 {
 			if bodyMsg.VariablesMetadata == nil {
 				return nil, fmt.Errorf("replaced terms in the prepared statement but prepared result doesn't have variables metadata: %v", bodyMsg)
 			}
@@ -993,10 +997,10 @@ func (ch *ClientHandler) processPreparedResponse(
 					"cloned PreparedResult is of different type: %v", newResponse.Body)
 			}
 
-			if prepareRequestInfo.ContainsPositionalMarkers() {
-				positionalMarkersToRemove := make([]int, 0, len(prepareRequestInfo.replacedTerms))
+			if preparedStatementInfo.containsPositionalMarkers {
+				positionalMarkersToRemove := make([]int, 0, len(preparedStatementInfo.replacedTerms))
 				positionalMarkerOffset := 0
-				for _, replacedTerm := range prepareRequestInfo.replacedTerms {
+				for _, replacedTerm := range preparedStatementInfo.replacedTerms {
 					positionalMarkersToRemove = append(
 						positionalMarkersToRemove,
 						positionalMarkerOffset+replacedTerm.previousPositionalIndex+1)
@@ -1393,9 +1397,8 @@ func (ch *ClientHandler) forwardRequest(request *frame.RawFrame, customResponseC
 		return err
 	}
 
-	// TODO: Should this account for both origin/target replacedTerms?
 	requestInfo, err := buildRequestInfo(
-		requestContext, originFrame.replacedTerms, ch.preparedStatementCache, ch.metricHandler, currentKeyspace, ch.primaryCluster,
+		originFrame, targetFrame, ch.preparedStatementCache, ch.metricHandler, currentKeyspace, ch.primaryCluster,
 		ch.forwardSystemQueriesToTarget, ch.topologyConfig.VirtualizationEnabled, ch.forwardAuthToTarget, ch.timeUuidGenerator)
 	if err != nil {
 		var errVal *UnpreparedExecuteError
@@ -1707,19 +1710,19 @@ func (ch *ClientHandler) handleExecuteRequest(
 	}
 
 	sendToAsyncConnector := (castedRequestInfo.ShouldAlsoBeSentAsync() || fwdDecision == forwardToAsyncOnly) && ch.asyncConnector != nil
-	replacedTerms := prepareRequestInfo.GetReplacedTerms()
+	originReplacedTerms := prepareRequestInfo.originPreparedStatementInfo.replacedTerms
 	asyncConnectorIsOrigin := ch.asyncConnector != nil && ch.asyncConnector.clusterType == common.ClusterTypeOrigin
 	var replacementTimeUuids []*uuid.UUID
-	if len(replacedTerms) > 0 && (fwdDecision == forwardToBoth || fwdDecision == forwardToOrigin || (sendToAsyncConnector && asyncConnectorIsOrigin)) {
+	if len(originReplacedTerms) > 0 && (fwdDecision == forwardToBoth || fwdDecision == forwardToOrigin || (sendToAsyncConnector && asyncConnectorIsOrigin)) {
 		clientRequest, err := originFrameContext.GetOrDecodeFrame()
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("could not decode execute raw frame: %w", err)
 		}
 
-		replacementTimeUuids = ch.parameterModifier.generateTimeUuids(prepareRequestInfo)
+		replacementTimeUuids = ch.parameterModifier.generateTimeUuids(prepareRequestInfo.originPreparedStatementInfo)
 		newOriginRequest := clientRequest.DeepCopy()
 		_, err = ch.parameterModifier.AddValuesToExecuteFrame(
-			newOriginRequest, prepareRequestInfo, preparedData.GetOriginVariablesMetadata(), replacementTimeUuids)
+			newOriginRequest, prepareRequestInfo.originPreparedStatementInfo, preparedData.GetOriginVariablesMetadata(), replacementTimeUuids)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("could not add values to origin EXECUTE: %w", err)
 		}
@@ -1740,13 +1743,14 @@ func (ch *ClientHandler) handleExecuteRequest(
 		}
 
 		newTargetRequest := clientRequest.DeepCopy()
+		targetReplacedTerms := prepareRequestInfo.targetPreparedStatementInfo.replacedTerms
 		var newTargetExecuteMsg *message.Execute
-		if len(replacedTerms) > 0 {
+		if len(targetReplacedTerms) > 0 {
 			if replacementTimeUuids == nil {
-				replacementTimeUuids = ch.parameterModifier.generateTimeUuids(prepareRequestInfo)
+				replacementTimeUuids = ch.parameterModifier.generateTimeUuids(prepareRequestInfo.targetPreparedStatementInfo)
 			}
 			newTargetExecuteMsg, err = ch.parameterModifier.AddValuesToExecuteFrame(
-				newTargetRequest, prepareRequestInfo, preparedData.GetTargetVariablesMetadata(), replacementTimeUuids)
+				newTargetRequest, prepareRequestInfo.targetPreparedStatementInfo, preparedData.GetTargetVariablesMetadata(), replacementTimeUuids)
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("could not add values to target EXECUTE: %w", err)
 			}
@@ -1799,7 +1803,9 @@ func (ch *ClientHandler) handleBatchRequest(
 
 	for stmtIdx, preparedData := range castedRequestInfo.GetPreparedDataByStmtIdx() {
 		prepareRequestInfo := preparedData.GetPrepareRequestInfo()
-		if len(prepareRequestInfo.GetReplacedTerms()) > 0 {
+		// TODO: Should check for both origin and target replacedTerms to allow
+		// 		 function replacement to work
+		if len(prepareRequestInfo.originPreparedStatementInfo.replacedTerms) > 0 {
 			if newOriginRequest == nil {
 				newOriginRequest = originDecodedFrame.DeepCopy()
 				newOriginBatchMsg, ok = newOriginRequest.Body.Message.(*message.Batch)
@@ -1807,12 +1813,13 @@ func (ch *ClientHandler) handleBatchRequest(
 					return nil, nil, fmt.Errorf("expected Batch but got %v instead", newOriginRequest.Body.Message.GetOpCode())
 				}
 			}
-			replacementTimeUuids := ch.parameterModifier.generateTimeUuids(prepareRequestInfo)
+			targetReplacementTimeUuids := ch.parameterModifier.generateTimeUuids(prepareRequestInfo.targetPreparedStatementInfo)
 			err = ch.parameterModifier.addValuesToBatchChild(targetDecodedFrame.Header.Version, newTargetBatchMsg.Children[stmtIdx],
-				preparedData.GetPrepareRequestInfo(), preparedData.GetTargetVariablesMetadata(), replacementTimeUuids)
+				preparedData.GetPrepareRequestInfo().targetPreparedStatementInfo, preparedData.GetTargetVariablesMetadata(), targetReplacementTimeUuids)
 			if err == nil && newOriginBatchMsg != nil {
+				originReplacementTimeUuids := ch.parameterModifier.generateTimeUuids(prepareRequestInfo.originPreparedStatementInfo)
 				err = ch.parameterModifier.addValuesToBatchChild(originDecodedFrame.Header.Version, newOriginBatchMsg.Children[stmtIdx],
-					preparedData.GetPrepareRequestInfo(), preparedData.GetOriginVariablesMetadata(), replacementTimeUuids)
+					preparedData.GetPrepareRequestInfo().originPreparedStatementInfo, preparedData.GetOriginVariablesMetadata(), originReplacementTimeUuids)
 			}
 			if err != nil {
 				return nil, nil, fmt.Errorf("could not add values to batch child statement: %w", err)
@@ -1845,7 +1852,7 @@ func (ch *ClientHandler) handleBatchRequest(
 }
 
 func (ch *ClientHandler) sendToAsyncConnector(originRequest *frame.RawFrame, targetRequest *frame.RawFrame,
-	fwdDecision forwardDecision, reqCtx *requestContextImpl, holder *requestContextHolder, sendAlsoToAsync bool,
+	fwdDecision ForwardDecision, reqCtx *requestContextImpl, holder *requestContextHolder, sendAlsoToAsync bool,
 	overallRequestStartTime time.Time, requestTimeout time.Duration) error {
 	var asyncRequest *frame.RawFrame
 	if ch.primaryCluster == common.ClusterTypeTarget {

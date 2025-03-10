@@ -74,8 +74,10 @@ func convertEncodedRequestToRawFrameForTests(queryFrame *frame.Frame, t *testing
 func parseEncodedRequestForTests(queryRawFrame *frame.RawFrame, t *testing.T) (RequestInfo, error) {
 	generalParams := getGeneralParamsForTests(t)
 
-	return buildRequestInfo(&frameDecodeContext{frame: queryRawFrame},
-		[]*statementReplacedTerms{},
+	commonFrame := &InFlightFrame{decodeContext: &frameDecodeContext{frame: queryRawFrame}}
+	return buildRequestInfo(
+		commonFrame,
+		commonFrame,
 		generalParams.psCache,
 		generalParams.mh,
 		generalParams.kn,

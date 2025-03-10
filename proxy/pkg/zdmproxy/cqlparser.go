@@ -13,14 +13,14 @@ import (
 	"strings"
 )
 
-type forwardDecision string
+type ForwardDecision string
 
 const (
-	forwardToOrigin    = forwardDecision("origin")
-	forwardToTarget    = forwardDecision("target")
-	forwardToBoth      = forwardDecision("both")
-	forwardToNone      = forwardDecision("none")
-	forwardToAsyncOnly = forwardDecision("async") // for "synchronous" requests that should be sent to the async connector (handshake requests)
+	forwardToOrigin    = ForwardDecision("origin")
+	forwardToTarget    = ForwardDecision("target")
+	forwardToBoth      = ForwardDecision("both")
+	forwardToNone      = ForwardDecision("none")
+	forwardToAsyncOnly = ForwardDecision("async") // for "synchronous" requests that should be sent to the async connector (handshake requests)
 )
 
 type interceptedQueryType string
@@ -60,8 +60,8 @@ func (uee *UnpreparedExecuteError) Error() string {
 }
 
 func buildRequestInfo(
-	frameContext *frameDecodeContext,
-	stmtsReplacedTerms []*statementReplacedTerms,
+	originFrame *InFlightFrame,
+	targetFrame *InFlightFrame,
 	psCache *PreparedStatementCache,
 	mh *metrics.MetricHandler,
 	currentKeyspaceName string,
@@ -71,41 +71,29 @@ func buildRequestInfo(
 	forwardAuthToTarget bool,
 	timeUuidGenerator TimeUuidGenerator) (RequestInfo, error) {
 
-	f := frameContext.GetRawFrame()
-	switch f.Header.OpCode {
+	originFrameContext := originFrame.decodeContext
+
+	streamId := originFrame.decodeContext.GetRawFrame().Header.StreamId
+	switch originFrameContext.GetRawFrame().Header.OpCode {
 	case primitive.OpCodeQuery:
-		stmtQueryData, err := frameContext.GetOrInspectStatement(currentKeyspaceName, timeUuidGenerator)
+		stmtQueryData, err := originFrameContext.GetOrInspectStatement(currentKeyspaceName, timeUuidGenerator)
 		if err != nil {
 			return nil, fmt.Errorf("could not inspect QUERY frame: %w", err)
 		}
-		return getRequestInfoFromQueryInfo(
-			frameContext.GetRawFrame(), primaryCluster,
-			forwardSystemQueriesToTarget, virtualizationEnabled, stmtQueryData.queryData), nil
+		return getRequestInfoFromQueryInfo(streamId, primaryCluster, forwardSystemQueriesToTarget, virtualizationEnabled, stmtQueryData.queryData), nil
 	case primitive.OpCodePrepare:
-		stmtQueryData, err := frameContext.GetOrInspectStatement(currentKeyspaceName, timeUuidGenerator)
+		originPreparedStatementInfo, originStmtQueryData, err := getPreparedInfo(originFrame, currentKeyspaceName, timeUuidGenerator)
 		if err != nil {
-			return nil, fmt.Errorf("could not inspect PREPARE frame: %w", err)
+			return nil, err
 		}
-		decodedFrame, err := frameContext.GetOrDecodeFrame()
+		targetPreparedStatementInfo, _, err := getPreparedInfo(targetFrame, currentKeyspaceName, timeUuidGenerator)
 		if err != nil {
-			return nil, fmt.Errorf("could not decode frame: %w", err)
+			return nil, err
 		}
-		prepareMsg, ok := decodedFrame.Body.Message.(*message.Prepare)
-		if !ok {
-			return nil, fmt.Errorf("unexpected message type when decoding PREPARE message: %v", decodedFrame.Body.Message)
-		}
-		baseRequestInfo := getRequestInfoFromQueryInfo(
-			frameContext.GetRawFrame(), primaryCluster,
-			forwardSystemQueriesToTarget, virtualizationEnabled, stmtQueryData.queryData)
-		replacedTerms := make([]*term, 0)
-		if len(stmtsReplacedTerms) > 1 {
-			return nil, fmt.Errorf("expected single list of replaced terms for prepare message but got %v", len(stmtsReplacedTerms))
-		} else if len(stmtsReplacedTerms) == 1 {
-			replacedTerms = stmtsReplacedTerms[0].replacedTerms
-		}
-		return NewPrepareRequestInfo(baseRequestInfo, replacedTerms, stmtQueryData.queryData.hasPositionalBindMarkers(), prepareMsg.Query, prepareMsg.Keyspace), nil
+		baseRequestInfo := getRequestInfoFromQueryInfo(streamId, primaryCluster, forwardSystemQueriesToTarget, virtualizationEnabled, originStmtQueryData.queryData)
+		return NewPrepareRequestInfo(baseRequestInfo, originPreparedStatementInfo, targetPreparedStatementInfo), nil
 	case primitive.OpCodeBatch:
-		decodedFrame, err := frameContext.GetOrDecodeFrame()
+		decodedFrame, err := originFrameContext.GetOrDecodeFrame()
 		if err != nil {
 			return nil, fmt.Errorf("could not decode batch raw frame: %w", err)
 		}
@@ -126,7 +114,7 @@ func buildRequestInfo(
 		}
 		return NewBatchRequestInfo(preparedDataByStmtIdxMap), nil
 	case primitive.OpCodeExecute:
-		decodedFrame, err := frameContext.GetOrDecodeFrame()
+		decodedFrame, err := originFrameContext.GetOrDecodeFrame()
 		if err != nil {
 			return nil, fmt.Errorf("could not decode execute raw frame: %w", err)
 		}
@@ -153,6 +141,30 @@ func buildRequestInfo(
 	}
 }
 
+func getPreparedInfo(inFlightFrame *InFlightFrame, currentKeyspaceName string, timeUuidGenerator TimeUuidGenerator) (*PreparedStatementInfo, *statementQueryData, error) {
+	stmtQueryData, err := inFlightFrame.decodeContext.GetOrInspectStatement(currentKeyspaceName, timeUuidGenerator)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not inspect PREPARE frame: %w", err)
+	}
+	decodedFrame, err := inFlightFrame.decodeContext.GetOrDecodeFrame()
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not decode frame: %w", err)
+	}
+	prepareMsg, ok := decodedFrame.Body.Message.(*message.Prepare)
+	if !ok {
+		return nil, nil, fmt.Errorf("unexpected message type when decoding PREPARE message: %v", decodedFrame.Body.Message)
+	}
+
+	replacedTerms := make([]*term, 0)
+	if len(inFlightFrame.replacedTerms) > 1 {
+		return nil, nil, fmt.Errorf("expected single list of replaced terms for prepare message but got %v", len(inFlightFrame.replacedTerms))
+	} else if len(inFlightFrame.replacedTerms) == 1 {
+		replacedTerms = inFlightFrame.replacedTerms[0].replacedTerms
+	}
+
+	return NewPreparedStatementInfo(prepareMsg.Keyspace, prepareMsg.Query, replacedTerms, stmtQueryData.queryData.hasPositionalBindMarkers()), stmtQueryData, nil
+}
+
 func getPreparedData(
 	psCache *PreparedStatementCache,
 	mh *metrics.MetricHandler,
@@ -172,7 +184,7 @@ func getPreparedData(
 }
 
 func getRequestInfoFromQueryInfo(
-	f *frame.RawFrame,
+	streamId int16,
 	primaryCluster common.ClusterType,
 	forwardSystemQueriesToTarget bool,
 	virtualizationEnabled bool,
@@ -184,20 +196,20 @@ func getRequestInfoFromQueryInfo(
 		if virtualizationEnabled {
 			parsedSelectClause := queryInfo.getParsedSelectClause()
 			if isSystemLocal(queryInfo) {
-				log.Debugf("Detected system local query: %v with stream id: %v", queryInfo.getQuery(), f.Header.StreamId)
+				log.Debugf("Detected system local query: %v with stream id: %v", queryInfo.getQuery(), streamId)
 				return NewInterceptedRequestInfo(local, parsedSelectClause)
 			} else if isSystemPeersV1(queryInfo) {
-				log.Debugf("Detected system peers query: %v with stream id: %v", queryInfo.getQuery(), f.Header.StreamId)
+				log.Debugf("Detected system peers query: %v with stream id: %v", queryInfo.getQuery(), streamId)
 				return NewInterceptedRequestInfo(peersV1, parsedSelectClause)
 			} else if isSystemPeersV2(queryInfo) {
-				log.Debugf("Detected system peers_v2 query: %v with stream id: %v", queryInfo.getQuery(), f.Header.StreamId)
+				log.Debugf("Detected system peers_v2 query: %v with stream id: %v", queryInfo.getQuery(), streamId)
 				return NewInterceptedRequestInfo(peersV2, parsedSelectClause)
 			}
 		}
 
 		if isSystemQuery(queryInfo) {
 			sendAlsoToAsync = false
-			log.Debugf("Detected system query: %v with stream id: %v", queryInfo.getQuery(), f.Header.StreamId)
+			log.Debugf("Detected system query: %v with stream id: %v", queryInfo.getQuery(), streamId)
 			if forwardSystemQueriesToTarget {
 				forwardDecision = forwardToTarget
 			} else {

@@ -370,9 +370,13 @@ func (cc *ClusterConnector) handleAsyncResponse(response *frame.RawFrame) *frame
 						log.Warnf("Received UNPREPARED for async request with prepare ID %v "+
 							"but could not find prepared data.", hex.EncodeToString(msg.Id))
 					} else {
+						preparedStatementInfo := preparedData.GetPrepareRequestInfo().targetPreparedStatementInfo
+						if cc.clusterType == common.ClusterTypeOrigin {
+							preparedStatementInfo = preparedData.GetPrepareRequestInfo().originPreparedStatementInfo
+						}
 						prepare := &message.Prepare{
-							Query:    preparedData.GetPrepareRequestInfo().GetQuery(),
-							Keyspace: preparedData.GetPrepareRequestInfo().GetKeyspace(),
+							Query:    preparedStatementInfo.query,
+							Keyspace: preparedStatementInfo.keyspace,
 						}
 						prepareFrame := frame.NewFrame(response.Header.Version, response.Header.StreamId, prepare)
 						prepareRawFrame, err := defaultCodec.ConvertToRawFrame(prepareFrame)

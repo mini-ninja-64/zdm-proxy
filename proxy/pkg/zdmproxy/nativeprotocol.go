@@ -155,15 +155,15 @@ func (recv *ParsedRow) IsNull(column string) bool {
 	return val == nil
 }
 
-func EncodePreparedResult(
-	prepareRequestInfo *PrepareRequestInfo, connectionKeyspace string, columns []*message.ColumnMetadata) (
+func encodePreparedResult(
+	preparedStatementInfo *PreparedStatementInfo, connectionKeyspace string, columns []*message.ColumnMetadata) (
 	*message.PreparedResult, error) {
 	if len(columns) == 0 {
 		return nil, errors.New("could not compute column metadata for system peers prepared result")
 	}
 
-	query := prepareRequestInfo.GetQuery()
-	keyspace := prepareRequestInfo.GetKeyspace()
+	query := preparedStatementInfo.query
+	keyspace := preparedStatementInfo.keyspace
 	if keyspace == "" {
 		keyspace = connectionKeyspace
 	}
@@ -540,7 +540,7 @@ func NewSystemLocalResult(
 	}
 
 	if prepareRequestInfo != nil {
-		return EncodePreparedResult(prepareRequestInfo, connectionKeyspace, columns)
+		return encodePreparedResult(prepareRequestInfo.originPreparedStatementInfo, connectionKeyspace, columns)
 	} else {
 		return EncodeRowsResult(genericTypeCodec, version, columns, [][]interface{}{row})
 	}
@@ -684,7 +684,7 @@ func NewSystemPeersResult(
 	}
 
 	if prepareRequestInfo != nil {
-		return EncodePreparedResult(prepareRequestInfo, connectionKeyspace, columns)
+		return encodePreparedResult(prepareRequestInfo.originPreparedStatementInfo, connectionKeyspace, columns)
 	}
 
 	// delete rows if the proxy added itself to the peers rows result

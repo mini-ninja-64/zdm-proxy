@@ -30,7 +30,7 @@ func (ch *ClientHandler) handleSecondaryHandshakeStartup(
 	clientIPAddress := ch.clientConnector.connection.RemoteAddr()
 	var clusterAddress net.Addr
 	var logIdentifier string
-	var forwardToSecondary forwardDecision
+	var forwardToSecondary ForwardDecision
 	requestTimeout := time.Duration(ch.conf.ProxyRequestTimeoutMs) * time.Millisecond
 	if asyncConnector {
 		clusterAddress = ch.asyncConnector.connection.RemoteAddr()

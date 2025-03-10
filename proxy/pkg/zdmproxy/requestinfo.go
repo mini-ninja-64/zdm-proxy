@@ -3,22 +3,22 @@ package zdmproxy
 import "fmt"
 
 type RequestInfo interface {
-	GetForwardDecision() forwardDecision
+	GetForwardDecision() ForwardDecision
 	ShouldAlsoBeSentAsync() bool
 	ShouldBeTrackedInMetrics() bool
 }
 
 type baseRequestInfo struct {
-	forwardDecision       forwardDecision
+	forwardDecision       ForwardDecision
 	shouldAlsoBeSentAsync bool
 	trackMetrics          bool
 }
 
-func newBaseRequestInfo(decision forwardDecision, shouldBeSentAsync bool, trackMetrics bool) *baseRequestInfo {
+func newBaseRequestInfo(decision ForwardDecision, shouldBeSentAsync bool, trackMetrics bool) *baseRequestInfo {
 	return &baseRequestInfo{forwardDecision: decision, shouldAlsoBeSentAsync: shouldBeSentAsync, trackMetrics: trackMetrics}
 }
 
-func (recv *baseRequestInfo) GetForwardDecision() forwardDecision {
+func (recv *baseRequestInfo) GetForwardDecision() ForwardDecision {
 	return recv.forwardDecision
 }
 
@@ -34,7 +34,7 @@ type GenericRequestInfo struct {
 	*baseRequestInfo
 }
 
-func NewGenericRequestInfo(decision forwardDecision, shouldBeSentAsync bool, trackMetrics bool) *GenericRequestInfo {
+func NewGenericRequestInfo(decision ForwardDecision, shouldBeSentAsync bool, trackMetrics bool) *GenericRequestInfo {
 	return &GenericRequestInfo{baseRequestInfo: newBaseRequestInfo(decision, shouldBeSentAsync, trackMetrics)}
 }
 
@@ -43,31 +43,47 @@ func (recv *GenericRequestInfo) String() string {
 		recv.forwardDecision, recv.shouldAlsoBeSentAsync, recv.trackMetrics)
 }
 
-type PrepareRequestInfo struct {
-	baseRequestInfo           RequestInfo
+type PreparedStatementInfo struct {
+	keyspace                  string
+	query                     string
 	replacedTerms             []*term
 	containsPositionalMarkers bool
-	query                     string
-	keyspace                  string
+}
+
+func NewPreparedStatementInfo(keyspace string, query string, replacedTerms []*term, containsPositionalMarkers bool) *PreparedStatementInfo {
+	return &PreparedStatementInfo{
+		keyspace:                  keyspace,
+		query:                     query,
+		replacedTerms:             replacedTerms,
+		containsPositionalMarkers: containsPositionalMarkers,
+	}
+}
+
+func (recv *PreparedStatementInfo) String() string {
+	return fmt.Sprintf("PreparedStatementInfo{query: %v, keyspace: %v}", recv.query, recv.keyspace)
+}
+
+type PrepareRequestInfo struct {
+	baseRequestInfo             RequestInfo
+	originPreparedStatementInfo *PreparedStatementInfo
+	targetPreparedStatementInfo *PreparedStatementInfo
 }
 
 func NewPrepareRequestInfo(
 	baseRequestInfo RequestInfo,
-	replacedTerms []*term,
-	containsPositionalMarkers bool,
-	query string,
-	keyspace string) *PrepareRequestInfo {
+	originPreparedStatementInfo *PreparedStatementInfo,
+	targetPreparedStatementInfo *PreparedStatementInfo,
+) *PrepareRequestInfo {
 	return &PrepareRequestInfo{
-		baseRequestInfo:           baseRequestInfo,
-		replacedTerms:             replacedTerms,
-		containsPositionalMarkers: containsPositionalMarkers,
-		query:                     query,
-		keyspace:                  keyspace}
+		baseRequestInfo:             baseRequestInfo,
+		originPreparedStatementInfo: originPreparedStatementInfo,
+		targetPreparedStatementInfo: targetPreparedStatementInfo,
+	}
 }
 
 func (recv *PrepareRequestInfo) String() string {
-	return fmt.Sprintf("PrepareRequestInfo{baseRequestInfo: %v, query: %v, keyspace: %v}",
-		recv.baseRequestInfo, recv.query, recv.keyspace)
+	return fmt.Sprintf("PrepareRequestInfo{baseRequestInfo: %v, originPreparedStatementInfo: %v, targetPreparedStatementInfo: %v}",
+		recv.baseRequestInfo, recv.originPreparedStatementInfo, recv.targetPreparedStatementInfo)
 }
 
 func (recv *PrepareRequestInfo) ShouldAlsoBeSentAsync() bool {
@@ -78,15 +94,7 @@ func (recv *PrepareRequestInfo) ShouldBeTrackedInMetrics() bool {
 	return false
 }
 
-func (recv *PrepareRequestInfo) GetQuery() string {
-	return recv.query
-}
-
-func (recv *PrepareRequestInfo) GetKeyspace() string {
-	return recv.keyspace
-}
-
-func (recv *PrepareRequestInfo) GetForwardDecision() forwardDecision {
+func (recv *PrepareRequestInfo) GetForwardDecision() ForwardDecision {
 	if recv.GetBaseRequestInfo().GetForwardDecision() == forwardToNone {
 		return forwardToNone // intercepted queries
 	}
@@ -95,14 +103,6 @@ func (recv *PrepareRequestInfo) GetForwardDecision() forwardDecision {
 
 func (recv *PrepareRequestInfo) GetBaseRequestInfo() RequestInfo {
 	return recv.baseRequestInfo
-}
-
-func (recv *PrepareRequestInfo) GetReplacedTerms() []*term {
-	return recv.replacedTerms
-}
-
-func (recv *PrepareRequestInfo) ContainsPositionalMarkers() bool {
-	return recv.containsPositionalMarkers
 }
 
 type ExecuteRequestInfo struct {
@@ -117,7 +117,7 @@ func (recv *ExecuteRequestInfo) String() string {
 	return fmt.Sprintf("ExecuteRequestInfo{PreparedData: %v}", recv.preparedData)
 }
 
-func (recv *ExecuteRequestInfo) GetForwardDecision() forwardDecision {
+func (recv *ExecuteRequestInfo) GetForwardDecision() ForwardDecision {
 	return recv.preparedData.GetPrepareRequestInfo().GetBaseRequestInfo().GetForwardDecision()
 }
 
@@ -175,7 +175,7 @@ func (recv *BatchRequestInfo) String() string {
 	return fmt.Sprintf("BatchRequestInfo{PreparedDataByStmtIdx: %v}", recv.preparedDataByStmtIdx)
 }
 
-func (recv *BatchRequestInfo) GetForwardDecision() forwardDecision {
+func (recv *BatchRequestInfo) GetForwardDecision() ForwardDecision {
 	return forwardToBoth // always send BATCH to both, use origin's prepared IDs
 }
 
